@@ -4,72 +4,6 @@ HyperspectRus — Hyperspectral Camera App
 Raspberry Pi Zero + Picamera2 + STM32 + 800x480 touchscreen
 """
 
-import os
-import subprocess
-import glob
-
-# ── Display / XAUTHORITY auto-detection ──────────────────────────────────────
-# Must happen BEFORE any tkinter import.
-
-def _setup_display():
-    # 1. If DISPLAY already set and non-empty — trust it
-    if os.environ.get("DISPLAY", "").strip():
-        return
-
-    # 2. If we're already running as xinit child — just set :0 and continue
-    if "--xinit-child" in sys.argv:
-        os.environ["DISPLAY"] = ":0"
-        return
-
-    # 3. Try to find an already-running X server
-    for disp in (":0", ":0.0", ":1"):
-        os.environ["DISPLAY"] = disp
-        try:
-            r = subprocess.run(
-                ["xdpyinfo", "-display", disp],
-                capture_output=True, timeout=1
-            )
-            if r.returncode == 0:
-                return
-        except Exception:
-            pass
-
-    # 4. No X server found — relaunch self via xinit
-    #    xinit will start Xorg and then run this script as its only client.
-    xinit_path = subprocess.run(["which", "xinit"],
-                                capture_output=True).stdout.decode().strip()
-    if xinit_path:
-        print("No DISPLAY found — relaunching via xinit...")
-        os.execv(xinit_path, [
-            xinit_path,
-            sys.executable, os.path.abspath(sys.argv[0]), "--xinit-child",
-            "--", ":0", "vt1",
-        ])
-        # os.execv replaces the process; we never reach here
-
-    # 5. Last resort — set :0 and let Tk fail with a readable error
-    os.environ["DISPLAY"] = ":0"
-
-def _setup_xauthority():
-    if os.environ.get("XAUTHORITY", "").strip():
-        return
-    # Check common locations for .Xauthority
-    candidates = [
-        os.path.expanduser("~/.Xauthority"),
-        "/home/pi/.Xauthority",
-        "/run/user/1000/gdm/Xauthority",
-    ]
-    # Also search via glob for any runtime Xauthority
-    candidates += glob.glob("/tmp/.xauth*")
-    candidates += glob.glob("/run/user/*/.Xauthority")
-    for path in candidates:
-        if os.path.exists(path):
-            os.environ["XAUTHORITY"] = path
-            return
-
-_setup_display()
-_setup_xauthority()
-
 import tkinter as tk
 from tkinter import font as tkfont
 import threading
@@ -424,28 +358,47 @@ class App:
             return
         try:
             self.cam = Picamera2()
-            cfg = self.cam.create_preview_configuration(
-                main={"size": (640, 480), "format": "RGB888"}
+
+            # Основная конфигурация — фиксированная, как при съёмке
+            self.fixed_config = self.cam.create_preview_configuration(
+                main={
+                    "size": (1280, 720),      # или (1640, 1232) / (1920, 1080) — выбирай то, что тебе нужно
+                    "format": "RGB888"
+                },
+                # lores можно добавить, если нужно отдельный низкоразрешающий поток, но обычно не обязательно
             )
-            self.cam.configure(cfg)
+
+            self.cam.configure(self.fixed_config)
+
+            # Фиксируем все нужные параметры один раз
             self.cam.set_controls({
-                "AeEnable":  True,
-                "AwbEnable": True,
+                "AeEnable": False,           # выключаем автоэкспозицию
+                "AwbEnable": False,          # выключаем автобаланс белого
+                "ExposureTime": 1000,        # 1000 мкс = 1 мс (подбери под свои условия)
+                "AnalogueGain": 1.1,         # можно увеличить до 2.0–4.0 при слабом освещении
+                "ColourGains": (1.0, 1.0),   # фиксируем gains для R и B (если AwbEnable=False)
+                "AfMode": libcontrols.AfModeEnum.Manual,
+                "LensPosition": 12.0,        # фиксированный фокус (подбери значение под свой объектив)
+                # Дополнительно можно добавить:
+                # "Brightness": 0.0,
+                # "Contrast": 1.0,
+                # "Saturation": 1.0,
             })
+
+            print("Камера инициализирована с фиксированными параметрами")
         except Exception as e:
             print(f"Camera init error: {e}")
             self.cam = None
 
     def _start_cam_preview(self):
-        if not self.cam:
+        if not self.cam or self.cam_running:
             return
         try:
-            if not self.cam_running:
-                self.cam.start()
-                self.cam_running = True
+            self.cam.start()
+            self.cam_running = True
+            self._schedule_preview()
         except Exception as e:
-            print(f"Camera start: {e}")
-        self._schedule_preview()
+            print(f"Camera start error: {e}")
 
     def _stop_cam_preview(self):
         if self._preview_job:
@@ -860,68 +813,53 @@ class App:
     def _capture_sequence(self):
         images = []
 
-        if CAM_OK and self.cam:
-            try:
-                # Reconfigure for still
-                self.cam.stop()
-                still_cfg = self.cam.create_still_configuration(
-                    main={"size": (1280, 720), "format": "RGB888"}
-                )
-                self.cam.configure(still_cfg)
-                self.cam.set_controls({
-                    "AeEnable":    False,
-                    "AwbEnable":   False,
-                    "ExposureTime": 1000,
-                    "AnalogueGain": 1.1,
-                    "ColourGains":  (1.0, 1.0),
-                    "AfMode":      libcontrols.AfModeEnum.Manual,
-                    "LensPosition": 12.0,
-                })
-                self.cam.start()
-                self.cam_running = True
-                time.sleep(0.4)
+        if not (CAM_OK and self.cam):
+            images = self._dummy_images()
+            self.captures = images
+            self.prev_idx = 0
+            self.root.after(0, self._show_preview_screen)
+            return
 
-                for i, (led, wl, duty) in enumerate(LED_TABLE):
-                    msg = f"Снимок {i+1} / {len(LED_TABLE)}  —  {wl} нм"
-                    self.root.after(0, lambda m=msg: self.cap_progress.config(text=m))
-                    lmsg = f"LED {led}  ·  {duty}% PWM"
-                    self.root.after(0, lambda m=lmsg: self.cap_led_lbl.config(text=m))
+        try:
+            # Камера уже запущена с правильной конфигурацией и контролами
+            # Просто делаем захват (без stop/configure/start)
 
-                    if self.stm.connected:
-                        self.stm.led_duty(led, duty)
-                        self.stm.led_on(led)
-                        time.sleep(0.05)
+            for i, (led, wl, duty) in enumerate(LED_TABLE):
+                msg = f"Снимок {i+1} / {len(LED_TABLE)}  —  {wl} нм"
+                self.root.after(0, lambda m=msg: self.cap_progress.config(text=m))
+                lmsg = f"LED {led}  ·  {duty}% PWM"
+                self.root.after(0, lambda m=lmsg: self.cap_led_lbl.config(text=m))
 
-                    # Discard frames
-                    for _ in range(3):
-                        req = self.cam.capture_request()
-                        req.release()
+                if self.stm.connected:
+                    self.stm.led_duty(led, duty)
+                    self.stm.led_on(led)
+                    time.sleep(0.08)          # чуть больше, чтобы LED стабилизировался
 
-                    # Capture
+                # Пропускаем несколько кадров для стабильности
+                for _ in range(2):
                     req = self.cam.capture_request()
-                    buf = io.BytesIO()
-                    req.save("main", buf, format="jpeg")
                     req.release()
 
-                    if self.stm.connected:
-                        self.stm.led_off(led)
+                # Захватываем
+                req = self.cam.capture_request()
+                buf = io.BytesIO()
+                req.save("main", buf, format="jpeg")
+                req.release()
 
-                    buf.seek(0)
-                    img = Image.open(buf)
-                    img.load()
-                    images.append((wl, img.copy()))
+                if self.stm.connected:
+                    self.stm.led_off(led)
 
-                self.cam.stop()
-                self.cam_running = False
+                buf.seek(0)
+                img = Image.open(buf)
+                img.load()
+                images.append((wl, img.copy()))
 
-            except Exception as e:
-                print(f"Capture error: {e}")
-                images = self._dummy_images()
-        else:
+        except Exception as e:
+            print(f"Capture error: {e}")
             images = self._dummy_images()
 
-        self.captures  = images
-        self.prev_idx  = 0
+        self.captures = images
+        self.prev_idx = 0
         self.root.after(0, self._show_preview_screen)
 
     def _dummy_images(self):
@@ -1069,20 +1007,7 @@ class App:
 
     def _return_to_main(self):
         self.captures = []
-        # Re-init camera for preview mode
-        if CAM_OK and self.cam:
-            try:
-                prev_cfg = self.cam.create_preview_configuration(
-                    main={"size": (640, 480), "format": "RGB888"}
-                )
-                self.cam.configure(prev_cfg)
-                self.cam.set_controls({
-                    "AeEnable":  True,
-                    "AwbEnable": True,
-                })
-            except Exception as e:
-                print(f"Camera reconfig: {e}")
-        self._show_main()
+        self._show_main()   # здесь уже вызывается _start_cam_preview
 
     # ─────────────────────────────────────────────────────────────────────────
     # BOOT
