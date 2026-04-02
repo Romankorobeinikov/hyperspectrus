@@ -523,7 +523,7 @@ class App:
         self.frames["splash"] = f
 
         self.splash_logo_lbl = tk.Label(f, bg=BG)
-        self.splash_logo_lbl.place(relx=0.5, rely=0.28, anchor="center")
+        self.splash_logo_lbl.place(relx=0.5, rely=0.33, anchor="center")
 
         self.splash_bat_lbl = tk.Label(f, bg=BG)
         self.splash_bat_lbl.place(relx=0.5, rely=0.72, anchor="center")
@@ -829,7 +829,7 @@ class App:
                     if self.stm.connected:
                         self.stm.led_duty(led, duty)
                         self.stm.led_on(led)
-                        time.sleep(0.01)
+                        time.sleep(0.03)
 
                     
 
