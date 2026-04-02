@@ -59,7 +59,7 @@ PATIENT_ID  = "022"
 PREVIEW_W   = 480          # camera preview width
 PANEL_X     = PREVIEW_W + 8
 PANEL_W     = W - PREVIEW_W - 16
-STATUS_H    = 24
+STATUS_H    = 34
 
 # LED config  (led_index, wavelength_nm, capture_duty%)
 LED_TABLE = [
@@ -82,7 +82,7 @@ M_NBI  = "nbi"
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 BG          = "#000000"
-STATUS_BG   = "#0A0A0A"
+STATUS_BG   = "#000000"
 CARD_BG     = "#D4D4D4"
 CARD_FG     = "#1A1A1A"
 BTN_IDLE    = "#CECECE"
@@ -477,7 +477,7 @@ class App:
 
     def _refresh_battery_display(self):
         icon_name = battery_icon_name(self.battery_pct, self.charging)
-        ph = load_asset(icon_name, size=(78, 38))
+        ph = load_asset(icon_name, size=(72, 35))
         if ph:
             self._photo_cache["bat_icon"] = ph
             for lbl in [getattr(self, n, None) for n in
@@ -523,10 +523,10 @@ class App:
         self.frames["splash"] = f
 
         self.splash_logo_lbl = tk.Label(f, bg=BG)
-        self.splash_logo_lbl.place(relx=0.5, rely=0.30, anchor="center")
+        self.splash_logo_lbl.place(relx=0.5, rely=0.28, anchor="center")
 
         self.splash_bat_lbl = tk.Label(f, bg=BG)
-        self.splash_bat_lbl.place(relx=0.5, rely=0.68, anchor="center")
+        self.splash_bat_lbl.place(relx=0.5, rely=0.72, anchor="center")
 
         self.splash_warn = tk.Label(f, text="", fg=WARN_COL, bg=BG, font=("DejaVu Sans", 13))
         self.splash_warn.place(relx=0.5, rely=0.90, anchor="center")
@@ -534,8 +534,8 @@ class App:
     def _show_splash(self):
         self._show("splash")
 
-        # Logo
-        logo_ph = load_asset("logo.png", size=(420, 240))
+        # Logo — ещё больше
+        logo_ph = load_asset("logo.png", size=(580, 330))   # было (420, 240)
         if logo_ph:
             self._photo_cache["logo"] = logo_ph
             self.splash_logo_lbl.config(image=logo_ph, text="")
@@ -552,7 +552,7 @@ class App:
 
     def _refresh_splash_bat(self):
         icon_name = battery_icon_name(self.battery_pct, self.charging)
-        ph = load_asset(icon_name, size=(200, 100))
+        ph = load_asset(icon_name, size=(320, 160))   # было (200, 100)
         if ph:
             self._photo_cache["splash_bat"] = ph
             self.splash_bat_lbl.config(image=ph, text="")
@@ -636,7 +636,7 @@ class App:
         sb.pack_propagate(False)
 
         tk.Label(sb, text="HyperspectRus",
-                 font=("DejaVu Sans", 11, "bold"),
+                 font=("DejaVu Sans", 13, "bold"),
                  fg=ACCENT_GRN, bg=STATUS_BG,
                  ).place(x=8, y=3)
 
@@ -829,12 +829,9 @@ class App:
                     if self.stm.connected:
                         self.stm.led_duty(led, duty)
                         self.stm.led_on(led)
-                        time.sleep(0.08)
+                        time.sleep(0.01)
 
-                    # Discard frames
-                    for _ in range(3):
-                        req = self.cam.capture_request()
-                        req.release()
+                    
 
                     # Захват
                     req = self.cam.capture_request()
