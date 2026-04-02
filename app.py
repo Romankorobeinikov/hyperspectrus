@@ -813,53 +813,68 @@ class App:
     def _capture_sequence(self):
         images = []
 
-        if not (CAM_OK and self.cam):
-            images = self._dummy_images()
-            self.captures = images
-            self.prev_idx = 0
-            self.root.after(0, self._show_preview_screen)
-            return
+        if CAM_OK and self.cam:
+            try:
+                # Reconfigure for still
+                self.cam.stop()
+                still_cfg = self.cam.create_still_configuration(
+                    main={"size": (1280, 720), "format": "RGB888"}
+                )
+                self.cam.configure(still_cfg)
+                self.cam.set_controls({
+                    "AeEnable":    False,
+                    "AwbEnable":   False,
+                    "ExposureTime": 1000,
+                    "AnalogueGain": 1.1,
+                    "ColourGains":  (1.0, 1.0),
+                    "AfMode":      libcontrols.AfModeEnum.Manual,
+                    "LensPosition": 12.0,
+                })
+                self.cam.start()
+                self.cam_running = True
+                time.sleep(0.4)
 
-        try:
-            # Камера уже запущена с правильной конфигурацией и контролами
-            # Просто делаем захват (без stop/configure/start)
+                for i, (led, wl, duty) in enumerate(LED_TABLE):
+                    msg = f"Снимок {i+1} / {len(LED_TABLE)}  —  {wl} нм"
+                    self.root.after(0, lambda m=msg: self.cap_progress.config(text=m))
+                    lmsg = f"LED {led}  ·  {duty}% PWM"
+                    self.root.after(0, lambda m=lmsg: self.cap_led_lbl.config(text=m))
 
-            for i, (led, wl, duty) in enumerate(LED_TABLE):
-                msg = f"Снимок {i+1} / {len(LED_TABLE)}  —  {wl} нм"
-                self.root.after(0, lambda m=msg: self.cap_progress.config(text=m))
-                lmsg = f"LED {led}  ·  {duty}% PWM"
-                self.root.after(0, lambda m=lmsg: self.cap_led_lbl.config(text=m))
+                    if self.stm.connected:
+                        self.stm.led_duty(led, duty)
+                        self.stm.led_on(led)
+                        time.sleep(0.05)
 
-                if self.stm.connected:
-                    self.stm.led_duty(led, duty)
-                    self.stm.led_on(led)
-                    time.sleep(0.08)          # чуть больше, чтобы LED стабилизировался
+                    # Discard frames
+                    for _ in range(3):
+                        req = self.cam.capture_request()
+                        req.release()
 
-                # Пропускаем несколько кадров для стабильности
-                for _ in range(2):
+                    # Capture
                     req = self.cam.capture_request()
+                    buf = io.BytesIO()
+                    req.save("main", buf, format="jpeg")
                     req.release()
 
-                # Захватываем
-                req = self.cam.capture_request()
-                buf = io.BytesIO()
-                req.save("main", buf, format="jpeg")
-                req.release()
+                    if self.stm.connected:
+                        self.stm.led_off(led)
 
-                if self.stm.connected:
-                    self.stm.led_off(led)
+                    buf.seek(0)
+                    img = Image.open(buf)
+                    img.load()
+                    images.append((wl, img.copy()))
 
-                buf.seek(0)
-                img = Image.open(buf)
-                img.load()
-                images.append((wl, img.copy()))
+                self.cam.stop()
+                self.cam_running = False
 
-        except Exception as e:
-            print(f"Capture error: {e}")
+            except Exception as e:
+                print(f"Capture error: {e}")
+                images = self._dummy_images()
+        else:
             images = self._dummy_images()
 
-        self.captures = images
-        self.prev_idx = 0
+        self.captures  = images
+        self.prev_idx  = 0
         self.root.after(0, self._show_preview_screen)
 
     def _dummy_images(self):
