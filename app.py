@@ -1,1039 +1,1043 @@
 #!/usr/bin/env python3
 """
-HyperspectRus — Hyperspectral Camera Application
-Raspberry Pi Zero + PiCamera2 + STM32 via USB Serial
-Screen: 800x480 touchscreen
+HyperspectRus — Hyperspectral Camera App
+Raspberry Pi Zero + Picamera2 + STM32 + 800x480 touchscreen
 """
 
 import os
-import sys
-import time
-import io
-import threading
-import datetime
-import signal
-
-# Ensure DISPLAY is set
-if "DISPLAY" not in os.environ:
-    os.environ["DISPLAY"] = ":0"
+os.environ.setdefault('DISPLAY', ':0')
 
 import tkinter as tk
 from tkinter import font as tkfont
-from PIL import Image, ImageTk, ImageDraw, ImageFont
-import serial
+import threading
+import time
+import io
+import sys
+from pathlib import Path
 
-# ─────────────────────────────────────────
-#  CONFIG
-# ─────────────────────────────────────────
-SCREEN_W, SCREEN_H = 800, 480
-PATIENT_ID = "022"
-STM_PORT   = "/dev/ttyACM0"
-STM_BAUD   = 115200
+# ── PIL ──────────────────────────────────────────────────────────────────────
+try:
+    from PIL import Image, ImageTk, ImageDraw, ImageFont
+    PIL_OK = True
+except ImportError:
+    PIL_OK = False
+    print("WARNING: Pillow not installed")
 
-# LED table: (index, wavelength_nm, capture_duty%)
+# ── Serial ───────────────────────────────────────────────────────────────────
+try:
+    import serial
+    import serial.tools.list_ports
+    SERIAL_OK = True
+except ImportError:
+    SERIAL_OK = False
+    print("WARNING: pyserial not installed")
+
+# ── GPIO ─────────────────────────────────────────────────────────────────────
+try:
+    from gpiozero import Button as GpioButton
+    _gpio_btn = GpioButton(26, pull_up=True, bounce_time=0.05)
+    GPIO_OK = True
+except Exception as e:
+    GPIO_OK = False
+    _gpio_btn = None
+    print(f"GPIO not available: {e}")
+
+# ── Camera ───────────────────────────────────────────────────────────────────
+try:
+    from picamera2 import Picamera2
+    from libcamera import controls as libcontrols
+    CAM_OK = True
+except Exception as e:
+    CAM_OK = False
+    Picamera2 = None
+    print(f"Camera not available: {e}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+W, H        = 800, 480
+ASSETS      = Path("assets")
+PATIENT_ID  = "022"
+PREVIEW_W   = 480          # camera preview width
+PANEL_X     = PREVIEW_W + 8
+PANEL_W     = W - PREVIEW_W - 16
+STATUS_H    = 24
+
+# LED config  (led_index, wavelength_nm, capture_duty%)
 LED_TABLE = [
-    (1, 450,  100),
-    (2, 517,  100),
-    (3, 671,   60),
-    (4, 775,   60),
-    (5, 803,   50),
-    (6, 851,   40),
-    (7, 888,   60),
-    (8, 939,  100),
+    (1, 450, 100),
+    (2, 517, 100),
+    (3, 671,  60),
+    (4, 775,  60),
+    (5, 803,  50),
+    (6, 851,  40),
+    (7, 888,  60),
+    (8, 939, 100),
 ]
+PREVIEW_DUTY = 40   # % PWM during preview
+DEFAULT_DUTY = 20   # % PWM default setting
 
-# LED groups for preview illumination (40% PWM)
-LED_GROUPS = {
-    "RGB": [1, 2, 3],
-    "ИК":  [8],
-    "NBI": [2, 3],
-}
-PREVIEW_DUTY = 40
-DEFAULT_GROUP = "RGB"
+# Modes
+M_RGB  = "rgb"
+M_IR   = "ir"
+M_NBI  = "nbi"
 
-# Battery voltage range
-BAT_MIN_MV = 3300
-BAT_MAX_MV = 4200
-
-# Colors
-BG       = "#000000"
-ACCENT   = "#8BC34A"   # olive-green
-ACCENT2  = "#29B6F6"   # cyan
-RED_BTN  = "#C62828"
-GREEN_BTN= "#558B2F"
-GRAY_BTN = "#424242"
-TEXT_W   = "#FFFFFF"
-TEXT_D   = "#CCCCCC"
-PANEL_BG = "#111111"
-CARD_BG  = "#1A1A1A"
-DISABLED = "#333333"
-
-ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
+# ── Palette ───────────────────────────────────────────────────────────────────
+BG          = "#000000"
+STATUS_BG   = "#0A0A0A"
+CARD_BG     = "#D4D4D4"
+CARD_FG     = "#1A1A1A"
+BTN_IDLE    = "#CECECE"
+BTN_ACTIVE  = "#6E9B1E"   # olive green
+BTN_FINISH  = "#767676"
+BTN_DANGER  = "#B03030"
+BTN_OK      = "#4A8A18"
+TEXT_WHITE  = "#FFFFFF"
+TEXT_DIM    = "#888888"
+ACCENT_GRN  = "#6FCF3A"
+ACCENT_ORG  = "#FF8C00"
+WARN_COL    = "#FF6600"
 
 
-# ─────────────────────────────────────────
-#  STM32 CONTROLLER (with reconnect logic)
-# ─────────────────────────────────────────
-class STMController:
-    def __init__(self, port=STM_PORT, baud=STM_BAUD):
-        self.port = port
-        self.baud = baud
-        self.ser = None
+# ═══════════════════════════════════════════════════════════════════════════════
+# STM32 CONTROLLER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class STM32:
+    PORTS   = ["/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyUSB0", "/dev/ttyUSB1"]
+    BAUD    = 115200
+    TIMEOUT = 0.5
+
+    def __init__(self):
+        self.ser       = None
         self.connected = False
-        self._lock = threading.Lock()
+        self._lock     = threading.Lock()
         self._connect()
 
+    # ── internal ────────────────────────────────────────────────────────────
+
     def _connect(self):
+        if not SERIAL_OK:
+            return
+        for port in self.PORTS:
+            try:
+                s = serial.Serial(port, self.BAUD, timeout=self.TIMEOUT)
+                self.ser       = s
+                self.connected = True
+                time.sleep(0.3)
+                print(f"STM32 connected on {port}")
+                return
+            except Exception:
+                pass
+        # fallback: scan all comports
         try:
-            self.ser = serial.Serial(self.port, self.baud, timeout=1)
-            time.sleep(0.5)
-            self.connected = True
-        except Exception as e:
-            print(f"[STM] Connect error: {e}")
-            self.ser = None
-            self.connected = False
-
-    def _send(self, cmd: str) -> str:
-        if not self.connected or self.ser is None:
-            return "disconnected"
-        try:
-            with self._lock:
-                self.ser.write(cmd.encode())
-                self.ser.flush()
-                time.sleep(0.005)
-                resp = self.ser.readline().decode(errors="ignore").strip()
-                return resp
-        except Exception as e:
-            print(f"[STM] Send error: {e}")
-            self.connected = False
-            self._try_reconnect()
-            return "error"
-
-    def _try_reconnect(self):
-        print("[STM] Reconnecting…")
-        try:
-            if self.ser:
-                self.ser.close()
+            for p in serial.tools.list_ports.comports():
+                try:
+                    s = serial.Serial(p.device, self.BAUD, timeout=self.TIMEOUT)
+                    self.ser       = s
+                    self.connected = True
+                    time.sleep(0.3)
+                    print(f"STM32 connected on {p.device}")
+                    return
+                except Exception:
+                    pass
         except Exception:
             pass
+        print("STM32 not found")
+
+    def _cmd(self, cmd: str) -> str:
+        with self._lock:
+            if not self.connected or not self.ser:
+                return ""
+            try:
+                self.ser.reset_input_buffer()
+                self.ser.write(cmd.encode("utf-8"))
+                self.ser.flush()
+                deadline = time.time() + self.TIMEOUT
+                buf = b""
+                while time.time() < deadline:
+                    chunk = self.ser.read(self.ser.in_waiting or 1)
+                    if chunk:
+                        buf += chunk
+                        if b"\n" in buf:
+                            break
+                    else:
+                        time.sleep(0.005)
+                return buf.decode("utf-8", errors="ignore").strip()
+            except serial.SerialException as e:
+                print(f"STM32 serial error: {e}")
+                self.connected = False
+                return ""
+            except Exception as e:
+                print(f"STM32 error: {e}")
+                return ""
+
+    def reconnect(self):
+        with self._lock:
+            if self.ser:
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+            self.ser       = None
+            self.connected = False
         time.sleep(1)
         self._connect()
 
-    def reset(self):
-        self._send("resetDevice\n")
-        time.sleep(2)
-        self._try_reconnect()
+    def reset_device(self):
+        self._cmd("resetDevice\n")
+
+    # ── public API ───────────────────────────────────────────────────────────
 
     def get_charging_state(self) -> int:
-        r = self._send("getChargingState\n")
+        """0 = not charging, 1 = charging, 2 = full"""
+        r = self._cmd("getChargingState\n")
         try:
             return int(r)
         except Exception:
             return -1
 
     def get_battery_mv(self) -> int:
-        r = self._send("getBatteryVoltage\n")
+        """Battery voltage in mV"""
+        r = self._cmd("getBatteryVoltage\n")
         try:
             return int(r)
         except Exception:
             return -1
 
-    def led_duty(self, n: int, duty: int):
-        cmd = f"sld{n}{duty}\n"
-        self._send(cmd)
+    def led_duty(self, led: int, duty: int):
+        self._cmd(f"setLedDuty{led}{duty}\n")
 
-    def led_on(self, n: int):
-        self._send(f"so{n}\n")
+    def led_on(self, led: int):
+        self._cmd(f"setOne{led}\n")
 
-    def led_off(self, n: int):
-        self._send(f"sso{n}\n")
+    def led_off(self, led: int):
+        self._cmd(f"setStopOne{led}\n")
 
-    def all_leds_off(self):
+    def all_off(self):
         for i in range(1, 9):
             self.led_off(i)
 
-    def set_group(self, group_name: str, duty: int = PREVIEW_DUTY):
-        self.all_leds_off()
-        leds = LED_GROUPS.get(group_name, [])
-        for n in leds:
-            self.led_duty(n, duty)
-            self.led_on(n)
-
-    def close(self):
-        try:
-            self.all_leds_off()
-            if self.ser:
-                self.ser.close()
-        except Exception:
-            pass
-
-
-# ─────────────────────────────────────────
-#  CAMERA (with graceful fallback)
-# ─────────────────────────────────────────
-class CameraController:
-    def __init__(self):
-        self.cam = None
-        self.available = False
-        self._init_camera()
-
-    def _init_camera(self):
-        try:
-            from picamera2 import Picamera2
-            from libcamera import controls as lc
-            self._lc = lc
-            self.cam = Picamera2()
-            cfg = self.cam.create_preview_configuration(
-                main={"size": (640, 480)}
-            )
-            self.cam.configure(cfg)
-            self.cam.start()
-            self._apply_controls(preview=True)
-            self.available = True
-        except Exception as e:
-            print(f"[CAM] Init error: {e}")
-            self.available = False
-
-    def _apply_controls(self, preview=True):
-        if not self.available:
-            return
-        try:
-            if preview:
-                ctrl = {
-                    "AeEnable": True,
-                    "AwbEnable": True,
-                }
-            else:
-                ctrl = {
-                    "AeEnable": False,
-                    "AwbEnable": False,
-                    "ExposureTime": 1000,
-                    "AnalogueGain": 1.1,
-                    "ColourGains": (1.0, 1.0),
-                }
-            from libcamera import controls as lc
-            ctrl["AfMode"] = lc.AfModeEnum.Manual
-            ctrl["LensPosition"] = 12.0
-            self.cam.set_controls(ctrl)
-        except Exception as e:
-            print(f"[CAM] Controls error: {e}")
-
-    def capture_frame_pil(self) -> Image.Image | None:
-        """Grab one frame as PIL Image."""
-        if not self.available:
-            return None
-        try:
-            buf = io.BytesIO()
-            req = self.cam.capture_request()
-            req.save("main", buf, format="jpeg")
-            req.release()
-            buf.seek(0)
-            return Image.open(buf).copy()
-        except Exception as e:
-            print(f"[CAM] Capture error: {e}")
-            return None
-
-    def capture_sequence(self) -> list[tuple[int, bytes]]:
-        """Capture 8 images (wavelength, jpeg_bytes). LEDs managed externally."""
-        images = []
-        if not self.available:
-            return images
-        self._apply_controls(preview=False)
-        time.sleep(0.3)
-        # discard 3 frames
-        for _ in range(3):
-            try:
-                req = self.cam.capture_request()
-                req.release()
-            except Exception:
-                pass
-        return images  # filled by caller
-
-    def stop(self):
-        if self.cam:
-            try:
-                self.cam.stop()
-            except Exception:
-                pass
+    def set_preview_leds(self, mode: str, duty: int = PREVIEW_DUTY):
+        self.all_off()
+        if mode == M_RGB:
+            for led in [1, 2, 3]:
+                self.led_duty(led, duty)
+                self.led_on(led)
+        elif mode == M_IR:
+            self.led_duty(8, duty)
+            self.led_on(8)
+        elif mode == M_NBI:
+            for led in [2, 3]:
+                self.led_duty(led, duty)
+                self.led_on(led)
 
 
-# ─────────────────────────────────────────
-#  ASSET HELPERS
-# ─────────────────────────────────────────
-def load_image(path: str, size=None) -> Image.Image | None:
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def mv_to_pct(mv: int) -> int:
+    """3000 mV = 0%, 4200 mV = 100%"""
+    if mv <= 0:
+        return 0
+    pct = int((mv - 3000) / (4200 - 3000) * 100)
+    return max(0, min(100, pct))
+
+
+def load_asset(name: str, size=None) -> "ImageTk.PhotoImage | None":
+    """Load image from assets/, optionally resize."""
+    if not PIL_OK:
+        return None
+    path = ASSETS / name
+    if not path.exists():
+        return None
     try:
         img = Image.open(path).convert("RGBA")
         if size:
             img = img.resize(size, Image.LANCZOS)
-        return img
+        return ImageTk.PhotoImage(img)
     except Exception as e:
-        print(f"[ASSET] Cannot load {path}: {e}")
+        print(f"Asset load error {name}: {e}")
         return None
 
 
-def pil_to_tk(img: Image.Image) -> ImageTk.PhotoImage:
-    return ImageTk.PhotoImage(img)
+def battery_icon_name(pct: int, charging: int) -> str:
+    """
+    bat1–bat5  : 0/25/50/75/100% not charging
+    bat6–bat10 : same with lightning (charging)
+    """
+    thresholds = [0, 25, 50, 75, 100]
+    idx = min(range(len(thresholds)), key=lambda i: abs(thresholds[i] - pct))
+    offset = 5 if charging in (1, 2) else 0
+    return f"bat{idx + 1 + offset}.jpg"
 
 
-def make_bat_icon(level: int, charging: bool, size=(60, 30)) -> Image.Image:
-    """Generate battery icon programmatically."""
-    w, h = size
-    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    body_w = w - 6
-    # Body
-    d.rounded_rectangle([0, 4, body_w, h - 4], radius=3, outline="#FFFFFF", width=2)
-    # Terminal
-    d.rectangle([body_w, h // 2 - 4, w - 1, h // 2 + 4], fill="#FFFFFF")
-    # Fill
-    fill_w = int((body_w - 4) * level / 100)
-    color = "#4CAF50" if level > 20 else "#F44336"
-    if fill_w > 0:
-        d.rectangle([2, 6, 2 + fill_w, h - 6], fill=color)
-    # Lightning bolt for charging
-    if charging:
-        bx, by = body_w // 2 - 4, 3
-        pts = [(bx+4, by), (bx+1, by+10), (bx+5, by+10), (bx+2, by+20), (bx+9, by+7), (bx+5, by+7), (bx+8, by)]
-        d.polygon(pts, fill="#FFD600")
-    return img
+def make_button(parent, text, font_obj, bg, fg, cmd, **place_kw):
+    btn = tk.Button(
+        parent, text=text, font=font_obj,
+        bg=bg, fg=fg, activebackground=bg, activeforeground=fg,
+        relief="flat", bd=0, highlightthickness=0,
+        cursor="hand2",
+        command=cmd,
+    )
+    btn.place(**place_kw)
+    return btn
 
 
-def bat_level_pct(mv: int) -> int:
-    pct = (mv - BAT_MIN_MV) / (BAT_MAX_MV - BAT_MIN_MV) * 100
-    return max(0, min(100, int(pct)))
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN APPLICATION
+# ═══════════════════════════════════════════════════════════════════════════════
 
+class App:
 
-# ─────────────────────────────────────────
-#  ROUNDED BUTTON HELPER
-# ─────────────────────────────────────────
-def make_round_btn(canvas: tk.Canvas, x, y, w, h, text, bg, fg,
-                   font_obj, radius=18, command=None, tag=None):
-    """Draw a rounded-rectangle button on a canvas."""
-    items = []
-
-    def draw_rrect(fill, outline):
-        r = radius
-        pts = [
-            x+r, y,
-            x+w-r, y,
-            x+w, y+r,
-            x+w, y+h-r,
-            x+w-r, y+h,
-            x+r, y+h,
-            x, y+h-r,
-            x, y+r,
-        ]
-        return canvas.create_polygon(pts, smooth=True, fill=fill,
-                                     outline=outline, width=2)
-
-    body = draw_rrect(bg, bg)
-    lbl  = canvas.create_text(x + w//2, y + h//2, text=text,
-                               fill=fg, font=font_obj)
-    items = [body, lbl]
-
-    if tag:
-        for it in items:
-            canvas.addtag_withtag(tag, it)
-
-    if command:
-        for it in items:
-            canvas.tag_bind(it, "<Button-1>", lambda e: command())
-
-    return items
-
-
-# ─────────────────────────────────────────
-#  MAIN APPLICATION
-# ─────────────────────────────────────────
-class HyperspectRus(tk.Tk):
     def __init__(self):
-        super().__init__()
-        self.title("HyperspectRus")
-        self.configure(bg=BG)
-        self.geometry(f"{SCREEN_W}x{SCREEN_H}+0+0")
-        self.resizable(False, False)
-        self.attributes("-fullscreen", True)
-        self.bind("<Escape>", lambda e: None)  # disable escape
+        # ── State ────────────────────────────────────────────────────────────
+        self.screen        = None
+        self.led_mode      = M_RGB
+        self.led_duty_val  = DEFAULT_DUTY
+        self.battery_pct   = 0
+        self.charging      = 0
+        self.stm_ok        = False
+        self.cam_running   = False
+        self.captures      = []   # list of (wl, PIL.Image)
+        self.prev_idx      = 0
+        self._preview_job  = None
+        self._bat_job      = None
 
-        # State
-        self.patient_id   = PATIENT_ID
-        self.light_group  = tk.StringVar(value=DEFAULT_GROUP)
-        self.current_frame = None   # PIL image for preview
-        self.captured_images: list[tuple[int, bytes]] = []
-        self.preview_idx  = 0
-        self.stm_ok       = True
+        # ── Hardware ─────────────────────────────────────────────────────────
+        self.stm    = STM32()
+        self.stm_ok = self.stm.connected
+        self.cam    = None
+        self._init_camera()
 
-        # Init hardware (non-blocking)
-        self.stm  = None
-        self.cam  = None
-        self._hw_init_done = False
+        # ── Root window ──────────────────────────────────────────────────────
+        self.root = tk.Tk()
+        self.root.title("HyperspectRus")
+        self.root.geometry(f"{W}x{H}+0+0")
+        self.root.configure(bg=BG)
+        self.root.attributes("-fullscreen", True)
+        self.root.resizable(False, False)
+        self.root.option_add("*tearOff", False)
 
-        # Fonts
-        self._load_fonts()
+        # ── Fonts ────────────────────────────────────────────────────────────
+        self.fnt_xl   = tkfont.Font(family="DejaVu Sans", size=40, weight="bold")
+        self.fnt_lg   = tkfont.Font(family="DejaVu Sans", size=28, weight="bold")
+        self.fnt_md   = tkfont.Font(family="DejaVu Sans", size=20)
+        self.fnt_mdb  = tkfont.Font(family="DejaVu Sans", size=20, weight="bold")
+        self.fnt_sm   = tkfont.Font(family="DejaVu Sans", size=13)
+        self.fnt_smb  = tkfont.Font(family="DejaVu Sans", size=13, weight="bold")
 
-        # Build UI frames
-        self._frames: dict[str, tk.Frame] = {}
-        self._build_all_screens()
+        # ── Asset cache ──────────────────────────────────────────────────────
+        self._photo_cache = {}
 
-        # Show splash
-        self._show_screen("splash")
+        # ── Frames ───────────────────────────────────────────────────────────
+        self.frames = {}
+        self._build_splash()
+        self._build_task_select()
+        self._build_main()
+        self._build_finish_confirm()
+        self._build_capturing()
+        self._build_preview()
 
-        # Start hardware init in background
-        threading.Thread(target=self._init_hardware, daemon=True).start()
+        # ── GPIO shutter button ───────────────────────────────────────────────
+        if GPIO_OK and _gpio_btn:
+            _gpio_btn.when_pressed = lambda: self.root.after(0, self._shutter_pressed)
 
-        # Battery polling
-        self._bat_level = 75
-        self._bat_charging = False
-        self._poll_battery()
+        # ── Background threads ────────────────────────────────────────────────
+        threading.Thread(target=self._battery_thread, daemon=True).start()
 
-        # External GPIO button
-        self._setup_gpio()
+        # ── First screen ─────────────────────────────────────────────────────
+        self.root.after(100, self._boot)
+        self.root.mainloop()
 
-        # Preview loop
-        self._preview_running = False
-        self._preview_after   = None
+    # ─────────────────────────────────────────────────────────────────────────
+    # CAMERA
+    # ─────────────────────────────────────────────────────────────────────────
 
-        self.protocol("WM_DELETE_WINDOW", self._quit)
-
-    # ── Fonts ──────────────────────────────
-    def _load_fonts(self):
-        self.fn_big    = tkfont.Font(family="DejaVu Sans", size=36, weight="bold")
-        self.fn_med    = tkfont.Font(family="DejaVu Sans", size=24)
-        self.fn_small  = tkfont.Font(family="DejaVu Sans", size=16)
-        self.fn_title  = tkfont.Font(family="DejaVu Sans", size=20, weight="bold")
-        self.fn_tiny   = tkfont.Font(family="DejaVu Sans", size=12)
-
-    # ── Hardware init ───────────────────────
-    def _init_hardware(self):
+    def _init_camera(self):
+        if not CAM_OK:
+            return
         try:
-            self.stm = STMController()
+            self.cam = Picamera2()
+            cfg = self.cam.create_preview_configuration(
+                main={"size": (640, 480), "format": "RGB888"}
+            )
+            self.cam.configure(cfg)
+            self.cam.set_controls({
+                "AeEnable":  True,
+                "AwbEnable": True,
+            })
         except Exception as e:
-            print(f"[APP] STM init failed: {e}")
-            self.stm = None
-
-        try:
-            self.cam = CameraController()
-        except Exception as e:
-            print(f"[APP] Camera init failed: {e}")
+            print(f"Camera init error: {e}")
             self.cam = None
 
-        self._hw_init_done = True
-
-        # After 2 sec on splash, check charging state
-        self.after(2000, self._after_splash)
-
-    def _after_splash(self):
-        if not self._hw_init_done:
-            self.after(500, self._after_splash)
+    def _start_cam_preview(self):
+        if not self.cam:
             return
-        self._check_charging_and_route()
-
-    def _check_charging_and_route(self):
-        charging = self._get_charging()
-        if charging:
-            self._show_screen("standby")
-        else:
-            self._show_screen("task")
-        # Start polling charging state
-        self._poll_charging()
-
-    def _get_charging(self) -> bool:
-        if self.stm and self.stm.connected:
-            st = self.stm.get_charging_state()
-            return st > 0
-        return False
-
-    def _poll_charging(self):
-        charging = self._get_charging()
-        current = self._current_screen()
-        if charging and current not in ("standby", "splash"):
-            self._preview_stop()
-            if self.stm:
-                self.stm.all_leds_off()
-            self._show_screen("standby")
-        elif not charging and current == "standby":
-            self._show_screen("task")
-        self.after(3000, self._poll_charging)
-
-    def _poll_battery(self):
-        def _do():
-            if self.stm and self.stm.connected:
-                mv = self.stm.get_battery_mv()
-                if mv > 0:
-                    self._bat_level = bat_level_pct(mv)
-                cs = self.stm.get_charging_state()
-                self._bat_charging = cs > 0
-                self.stm_ok = True
-            elif self.stm:
-                self.stm_ok = False
-            else:
-                self.stm_ok = False
-            self._update_status_bar()
-            self.after(5000, self._poll_battery)
-        _do()
-
-    def _update_status_bar(self):
-        """Refresh battery icon and STM warning on all screens."""
-        for name, frame in self._frames.items():
-            bar = getattr(frame, "_status_bar", None)
-            if bar:
-                bar.update_status(self._bat_level, self._bat_charging,
-                                  self.stm_ok if self.stm else False)
-
-    # ── GPIO ───────────────────────────────
-    def _setup_gpio(self):
         try:
-            from gpiozero import Button as GpioButton
-            self._gpio_btn = GpioButton(26, pull_up=True, bounce_time=0.05)
-            self._gpio_btn.when_pressed = self._on_hw_button
+            if not self.cam_running:
+                self.cam.start()
+                self.cam_running = True
         except Exception as e:
-            print(f"[GPIO] Not available: {e}")
-            self._gpio_btn = None
+            print(f"Camera start: {e}")
+        self._schedule_preview()
 
-    def _on_hw_button(self):
-        if self._current_screen() == "main":
-            self.after(0, self._start_capture)
+    def _stop_cam_preview(self):
+        if self._preview_job:
+            self.root.after_cancel(self._preview_job)
+            self._preview_job = None
+        if self.cam and self.cam_running:
+            try:
+                self.cam.stop()
+            except Exception:
+                pass
+            self.cam_running = False
 
-    # ── Screen management ───────────────────
-    def _current_screen(self) -> str:
-        for name, frame in self._frames.items():
-            if frame.winfo_ismapped():
-                return name
-        return ""
+    def _schedule_preview(self):
+        if self.screen == "main" and self.cam_running:
+            self._do_preview_frame()
 
-    def _show_screen(self, name: str):
-        for n, f in self._frames.items():
-            f.pack_forget()
-        if name in self._frames:
-            self._frames[name].pack(fill="both", expand=True)
-            self._frames[name].event_generate("<<ScreenShown>>")
-
-    # ── Build all screens ────────────────────
-    def _build_all_screens(self):
-        self._frames["splash"]  = self._build_splash()
-        self._frames["standby"] = self._build_standby()
-        self._frames["task"]    = self._build_task()
-        self._frames["main"]    = self._build_main()
-        self._frames["confirm_end"] = self._build_confirm_end()
-        self._frames["capturing"]   = self._build_capturing()
-        self._frames["preview_photos"] = self._build_preview_photos()
-
-    # ─────────────────────────────────────────
-    #  SPLASH SCREEN
-    # ─────────────────────────────────────────
-    def _build_splash(self) -> tk.Frame:
-        f = tk.Frame(self, bg=BG)
-        tk.Label(f, text="HyperspectRus", font=self.fn_big,
-                 bg=BG, fg=ACCENT).pack(expand=True)
-        tk.Label(f, text="Hyperspectral Imaging System",
-                 font=self.fn_small, bg=BG, fg="#666666").pack(pady=(0, 40))
-        # Loading bar
-        self._splash_bar = tk.Canvas(f, width=300, height=6,
-                                     bg="#222222", highlightthickness=0)
-        self._splash_bar.pack(pady=10)
-        self._splash_bar.create_rectangle(0, 0, 0, 6, fill=ACCENT, tags="bar")
-        f._status_bar = None
-        self._animate_splash_bar()
-        return f
-
-    def _animate_splash_bar(self, val=0):
-        if not hasattr(self, "_splash_bar"):
+    def _do_preview_frame(self):
+        if self.screen != "main" or not self.cam_running:
             return
-        self._splash_bar.coords("bar", 0, 0, val, 6)
-        if val < 300:
-            self.after(10, lambda: self._animate_splash_bar(val + 3))
+        try:
+            arr  = self.cam.capture_array()
+            img  = Image.fromarray(arr)
+            img  = img.resize((PREVIEW_W, H - STATUS_H), Image.NEAREST)
+            ph   = ImageTk.PhotoImage(img)
+            self.main_prev_lbl.config(image=ph, text="")
+            self.main_prev_lbl.image = ph
+        except Exception:
+            pass
+        self._preview_job = self.root.after(80, self._do_preview_frame)  # ~12 fps
 
-    # ─────────────────────────────────────────
-    #  STANDBY SCREEN (charging)
-    # ─────────────────────────────────────────
-    def _build_standby(self) -> tk.Frame:
-        f = tk.Frame(self, bg=BG)
-        f._status_bar = None
-        tk.Label(f, text="HyperspectRus", font=self.fn_big,
-                 bg=BG, fg=ACCENT).pack(expand=True, side="top", pady=(80, 0))
-        # Battery icon (large, ~200px wide)
-        self._standby_bat_canvas = tk.Canvas(f, width=200, height=100,
-                                              bg=BG, highlightthickness=0)
-        self._standby_bat_canvas.pack(pady=20)
-        self._standby_bat_img_ref = None
-        self._update_standby_bat()
+    # ─────────────────────────────────────────────────────────────────────────
+    # BATTERY BACKGROUND THREAD
+    # ─────────────────────────────────────────────────────────────────────────
 
-        tk.Label(f, text="Зарядка…", font=self.fn_med,
-                 bg=BG, fg="#888888").pack(pady=(0, 80))
-        f.bind("<<ScreenShown>>", lambda e: self._update_standby_bat())
-        return f
+    def _battery_thread(self):
+        while True:
+            try:
+                if not self.stm.connected:
+                    self.stm.reconnect()
+                    self.stm_ok = self.stm.connected
+                    self.root.after(0, self._refresh_warn_labels)
 
-    def _update_standby_bat(self):
-        img = make_bat_icon(self._bat_level, True, size=(200, 100))
-        tk_img = pil_to_tk(img)
-        self._standby_bat_canvas.delete("all")
-        self._standby_bat_canvas.create_image(0, 0, anchor="nw", image=tk_img)
-        self._standby_bat_img_ref = tk_img
-        self.after(3000, self._update_standby_bat)
+                if self.stm.connected:
+                    mv  = self.stm.get_battery_mv()
+                    chg = self.stm.get_charging_state()
 
-    # ─────────────────────────────────────────
-    #  TASK SELECTION SCREEN
-    # ─────────────────────────────────────────
-    def _build_task(self) -> tk.Frame:
-        f = tk.Frame(self, bg=BG)
-        f._status_bar = StatusBar(f)
-        f._status_bar.pack(fill="x", side="top")
+                    pct = mv_to_pct(mv) if mv > 0 else self.battery_pct
 
-        center = tk.Frame(f, bg=BG)
-        center.pack(expand=True)
+                    changed_chg = (chg >= 0 and chg != self.charging)
+
+                    self.battery_pct = pct
+                    if chg >= 0:
+                        self.charging = chg
+
+                    self.root.after(0, self._refresh_battery_display)
+
+                    if changed_chg:
+                        self.root.after(0, self._on_charge_changed)
+
+            except Exception as e:
+                print(f"Battery thread error: {e}")
+
+            time.sleep(5)
+
+    def _on_charge_changed(self):
+        if self.charging in (1, 2):
+            # Plugged in → standby
+            if self.screen != "splash":
+                self._stop_cam_preview()
+                threading.Thread(target=self.stm.all_off, daemon=True).start()
+                self._show_splash()
+        else:
+            # Unplugged → activate
+            if self.screen == "splash":
+                self._show_task_select()
+
+    def _refresh_battery_display(self):
+        icon_name = battery_icon_name(self.battery_pct, self.charging)
+        ph = load_asset(icon_name, size=(52, 26))
+        if ph:
+            self._photo_cache["bat_icon"] = ph
+            for lbl in [getattr(self, n, None) for n in
+                        ("main_bat_lbl",)]:
+                if lbl:
+                    lbl.config(image=ph)
+                    lbl.image = ph
+        else:
+            txt = f"{'⚡' if self.charging else '🔋'} {self.battery_pct}%"
+            for lbl in [getattr(self, n, None) for n in ("main_bat_lbl",)]:
+                if lbl:
+                    lbl.config(text=txt, image="")
+
+        # Splash battery (bigger icon)
+        if self.screen == "splash":
+            self._refresh_splash_bat()
+
+    def _refresh_warn_labels(self):
+        warn = "" if self.stm_ok else "⚠  Контроллер отключён"
+        for attr in ("splash_warn", "task_warn", "main_warn", "finish_warn"):
+            lbl = getattr(self, attr, None)
+            if lbl:
+                lbl.config(text=warn)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SCREEN SWITCHING
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _show(self, name: str):
+        for f in self.frames.values():
+            f.place_forget()
+        self.screen = name
+        f = self.frames[name]
+        f.place(x=0, y=0, width=W, height=H)
+        f.lift()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # BUILD: SPLASH / STANDBY
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_splash(self):
+        f = tk.Frame(self.root, bg=BG)
+        self.frames["splash"] = f
+
+        self.splash_logo_lbl = tk.Label(f, bg=BG)
+        self.splash_logo_lbl.place(relx=0.5, rely=0.36, anchor="center")
+
+        self.splash_bat_lbl = tk.Label(f, bg=BG)
+        self.splash_bat_lbl.place(relx=0.5, rely=0.68, anchor="center")
+
+        self.splash_warn = tk.Label(f, text="", fg=WARN_COL, bg=BG, font=("DejaVu Sans", 13))
+        self.splash_warn.place(relx=0.5, rely=0.90, anchor="center")
+
+    def _show_splash(self):
+        self._show("splash")
+
+        # Logo
+        logo_ph = load_asset("logo.png", size=(280, 160))
+        if logo_ph:
+            self._photo_cache["logo"] = logo_ph
+            self.splash_logo_lbl.config(image=logo_ph, text="")
+            self.splash_logo_lbl.image = logo_ph
+        else:
+            self.splash_logo_lbl.config(
+                text="HyperspectRus",
+                font=("DejaVu Sans", 44, "bold"),
+                fg=ACCENT_GRN, image="",
+            )
+
+        self._refresh_splash_bat()
+        self._refresh_warn_labels()
+
+    def _refresh_splash_bat(self):
+        icon_name = battery_icon_name(self.battery_pct, self.charging)
+        ph = load_asset(icon_name, size=(200, 100))
+        if ph:
+            self._photo_cache["splash_bat"] = ph
+            self.splash_bat_lbl.config(image=ph, text="")
+            self.splash_bat_lbl.image = ph
+        else:
+            sym = "⚡" if self.charging else "🔋"
+            self.splash_bat_lbl.config(
+                text=f"{sym}  {self.battery_pct}%",
+                font=("DejaVu Sans", 32), fg=TEXT_WHITE, image="",
+            )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # BUILD: TASK SELECT
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_task_select(self):
+        f = tk.Frame(self.root, bg=BG)
+        self.frames["task_select"] = f
+
+        self.task_warn = tk.Label(f, text="", fg=WARN_COL, bg=BG, font=("DejaVu Sans", 12))
+        self.task_warn.place(x=10, y=6)
 
         # Card
-        card = tk.Frame(center, bg=CARD_BG, padx=40, pady=30)
-        card.pack(padx=60, pady=20)
-        card.configure(bd=0, highlightbackground="#333", highlightthickness=1)
+        card = tk.Frame(f, bg=CARD_BG, bd=0)
+        card.place(relx=0.5, rely=0.33, anchor="center", width=720, height=210)
 
-        tk.Label(card, text=f'ID пациента: "{self.patient_id}"',
-                 font=self.fn_big, bg=CARD_BG, fg=TEXT_W).pack()
-        tk.Label(card, text="Начать съёмку?",
-                 font=self.fn_big, bg=CARD_BG, fg=TEXT_D).pack(pady=(20, 0))
+        self.task_title = tk.Label(card,
+                                    text=f'ID пациента:  "{PATIENT_ID}"',
+                                    font=("DejaVu Sans", 34, "bold"),
+                                    bg=CARD_BG, fg=CARD_FG)
+        self.task_title.place(relx=0.5, rely=0.30, anchor="center")
 
-        # Buttons
-        btn_row = tk.Frame(center, bg=BG)
-        btn_row.pack(pady=20)
+        self.task_action = tk.Label(card,
+                                     text="Начать съёмку?",
+                                     font=("DejaVu Sans", 28),
+                                     bg=CARD_BG, fg=CARD_FG)
+        self.task_action.place(relx=0.5, rely=0.68, anchor="center")
 
-        btn_x = RoundButton(btn_row, text="✕", bg=RED_BTN, fg=TEXT_W,
-                            font=self.fn_big, width=100, height=80,
-                            command=lambda: None)
-        btn_x.pack(side="left", padx=20)
+        # X button
+        tk.Button(f, text="✗",
+                  font=("DejaVu Sans", 52, "bold"),
+                  bg=BTN_IDLE, fg=BTN_DANGER,
+                  activebackground=BTN_IDLE, activeforeground=BTN_DANGER,
+                  relief="flat", bd=0, highlightthickness=0,
+                  cursor="hand2",
+                  command=self._task_cancel,
+                  ).place(relx=0.63, rely=0.76, anchor="center", width=140, height=120)
 
-        btn_ok = RoundButton(btn_row, text="✓", bg=GREEN_BTN, fg=TEXT_W,
-                             font=self.fn_big, width=100, height=80,
-                             command=self._go_main)
-        btn_ok.pack(side="left", padx=20)
+        # ✓ button
+        tk.Button(f, text="✓",
+                  font=("DejaVu Sans", 52, "bold"),
+                  bg=BTN_IDLE, fg=BTN_OK,
+                  activebackground=BTN_IDLE, activeforeground=BTN_OK,
+                  relief="flat", bd=0, highlightthickness=0,
+                  cursor="hand2",
+                  command=self._task_confirm,
+                  ).place(relx=0.83, rely=0.76, anchor="center", width=140, height=120)
 
-        f._status_bar.update_status(75, False, True)
-        return f
+    def _show_task_select(self, action_text="Начать съёмку?"):
+        self.task_action.config(text=action_text)
+        self._show("task_select")
+        self._refresh_warn_labels()
 
-    def _go_main(self):
-        self._show_screen("main")
-        self._preview_start()
-        if self.stm:
-            self.stm.set_group(self.light_group.get(), PREVIEW_DUTY)
+    def _task_cancel(self):
+        pass   # intentionally do nothing
 
-    # ─────────────────────────────────────────
-    #  MAIN SHOOTING SCREEN
-    # ─────────────────────────────────────────
-    def _build_main(self) -> tk.Frame:
-        f = tk.Frame(self, bg=BG)
+    def _task_confirm(self):
+        self._show_main()
 
-        # Top status bar
-        f._status_bar = StatusBar(f)
-        f._status_bar.pack(fill="x", side="top")
+    # ─────────────────────────────────────────────────────────────────────────
+    # BUILD: MAIN SHOOTING SCREEN
+    # ─────────────────────────────────────────────────────────────────────────
 
-        # Title strip
-        title_bar = tk.Frame(f, bg=PANEL_BG, height=36)
-        title_bar.pack(fill="x")
-        tk.Label(title_bar, text="HyperspectRus", font=self.fn_title,
-                 bg=PANEL_BG, fg=ACCENT).pack(side="left", padx=16)
-        tk.Label(title_bar, text=f"ID: {self.patient_id}",
-                 font=self.fn_small, bg=PANEL_BG, fg="#888").pack(side="right", padx=16)
+    def _build_main(self):
+        f = tk.Frame(self.root, bg=BG)
+        self.frames["main"] = f
 
-        # Body
-        body = tk.Frame(f, bg=BG)
-        body.pack(fill="both", expand=True)
+        # ── Status bar ────────────────────────────────────────────────────────
+        sb = tk.Frame(f, bg=STATUS_BG, height=STATUS_H)
+        sb.place(x=0, y=0, width=W, height=STATUS_H)
+        sb.pack_propagate(False)
 
-        # Camera preview (left)
-        self._preview_canvas = tk.Canvas(body, width=560, height=360,
-                                          bg="#0a0a0a", highlightthickness=0)
-        self._preview_canvas.pack(side="left", padx=(10, 5), pady=10)
-        self._preview_img_ref = None
+        tk.Label(sb, text="HyperspectRus",
+                 font=("DejaVu Sans", 11, "bold"),
+                 fg=ACCENT_GRN, bg=STATUS_BG,
+                 ).place(x=8, y=3)
 
-        # Right panel
-        right = tk.Frame(body, bg=BG, width=210)
-        right.pack(side="right", fill="y", padx=(5, 10), pady=10)
-        right.pack_propagate(False)
+        self.main_warn = tk.Label(sb, text="", fg=WARN_COL, bg=STATUS_BG,
+                                   font=("DejaVu Sans", 10))
+        self.main_warn.place(x=200, y=3)
 
-        # Light mode buttons
-        for grp_name, color in [("RGB", ACCENT), ("ИК", ACCENT2), ("NBI", "#FF8A65")]:
-            b = RoundButton(right, text=grp_name,
-                            bg=color if self.light_group.get() == grp_name else GRAY_BTN,
-                            fg=TEXT_W, font=self.fn_med,
-                            width=190, height=62,
-                            command=lambda g=grp_name: self._select_group(g))
-            b.pack(pady=6)
-            setattr(f, f"_btn_{grp_name}", b)
+        self.main_bat_lbl = tk.Label(sb, text="", fg=TEXT_WHITE, bg=STATUS_BG,
+                                      font=("DejaVu Sans", 10))
+        self.main_bat_lbl.place(x=W - 80, y=3)
 
-        tk.Frame(right, bg=BG, height=10).pack()
+        # ── Camera preview ────────────────────────────────────────────────────
+        self.main_prev_lbl = tk.Label(f, bg="#0A0A0A",
+                                       text="Камера недоступна",
+                                       fg=TEXT_DIM,
+                                       font=("DejaVu Sans", 16))
+        self.main_prev_lbl.place(x=0, y=STATUS_H,
+                                  width=PREVIEW_W, height=H - STATUS_H)
 
-        # Finish button
-        btn_end = RoundButton(right, text="завершить",
-                               bg="#37474F", fg=TEXT_D,
-                               font=self.fn_med, width=190, height=62,
-                               command=self._ask_finish)
-        btn_end.pack(side="bottom", pady=6)
+        # ── Right panel ───────────────────────────────────────────────────────
+        BY  = STATUS_H + 10         # panel top
+        BH  = 90                    # button height
+        GAP = 12
 
-        f.bind("<<ScreenShown>>", lambda e: self._preview_start())
-        return f
+        self.btn_rgb = tk.Button(f, text="RGB",
+                                  font=("DejaVu Sans", 26, "bold"),
+                                  bg=BTN_ACTIVE, fg="#111111",
+                                  activebackground=BTN_ACTIVE, activeforeground="#111111",
+                                  relief="flat", bd=0, highlightthickness=0,
+                                  cursor="hand2",
+                                  command=lambda: self._set_mode(M_RGB))
+        self.btn_rgb.place(x=PANEL_X, y=BY, width=PANEL_W, height=BH)
 
-    def _select_group(self, grp):
-        self.light_group.set(grp)
-        f = self._frames["main"]
-        for g, color in [("RGB", ACCENT), ("ИК", ACCENT2), ("NBI", "#FF8A65")]:
-            btn = getattr(f, f"_btn_{g}", None)
-            if btn:
-                btn.configure(bg=color if g == grp else GRAY_BTN)
-        if self.stm and self._current_screen() == "main":
-            self.stm.set_group(grp, PREVIEW_DUTY)
+        self.btn_ir  = tk.Button(f, text="ИК",
+                                  font=("DejaVu Sans", 26, "bold"),
+                                  bg=BTN_IDLE, fg="#111111",
+                                  activebackground=BTN_IDLE, activeforeground="#111111",
+                                  relief="flat", bd=0, highlightthickness=0,
+                                  cursor="hand2",
+                                  command=lambda: self._set_mode(M_IR))
+        self.btn_ir.place(x=PANEL_X, y=BY + BH + GAP, width=PANEL_W, height=BH)
 
-    # ─────────────────────────────────────────
-    #  PREVIEW LOOP
-    # ─────────────────────────────────────────
-    def _preview_start(self):
-        self._preview_running = True
-        self._preview_tick()
+        self.btn_nbi = tk.Button(f, text="NBI",
+                                  font=("DejaVu Sans", 26, "bold"),
+                                  bg=BTN_IDLE, fg="#111111",
+                                  activebackground=BTN_IDLE, activeforeground="#111111",
+                                  relief="flat", bd=0, highlightthickness=0,
+                                  cursor="hand2",
+                                  command=lambda: self._set_mode(M_NBI))
+        self.btn_nbi.place(x=PANEL_X, y=BY + 2*(BH + GAP), width=PANEL_W, height=BH)
 
-    def _preview_stop(self):
-        self._preview_running = False
-        if self._preview_after:
-            self.after_cancel(self._preview_after)
-            self._preview_after = None
+        # Finish button — taller, at bottom
+        self.btn_finish = tk.Button(f, text="завершить",
+                                     font=("DejaVu Sans", 20, "bold"),
+                                     bg=BTN_FINISH, fg="#DDDDDD",
+                                     activebackground=BTN_FINISH, activeforeground="#DDDDDD",
+                                     relief="flat", bd=0, highlightthickness=0,
+                                     cursor="hand2",
+                                     command=self._show_finish_confirm)
+        self.btn_finish.place(x=PANEL_X - 4, y=H - 115,
+                               width=PANEL_W + 8, height=106)
 
-    def _preview_tick(self):
-        if not self._preview_running:
-            return
-        if self.cam and self.cam.available:
-            img = self.cam.capture_frame_pil()
-            if img:
-                img = img.resize((560, 360), Image.LANCZOS)
-                tk_img = pil_to_tk(img)
-                self._preview_canvas.delete("all")
-                self._preview_canvas.create_image(0, 0, anchor="nw", image=tk_img)
-                self._preview_img_ref = tk_img
-        else:
-            # Placeholder
-            self._preview_canvas.delete("all")
-            self._preview_canvas.create_text(280, 180, text="Камера недоступна",
-                                              fill="#555", font=self.fn_med)
-        self._preview_after = self.after(100, self._preview_tick)
+    def _show_main(self):
+        self._show("main")
+        self._refresh_warn_labels()
+        self._refresh_battery_display()
+        self._set_mode(self.led_mode, silent=True)
+        self._start_cam_preview()
 
-    # ─────────────────────────────────────────
-    #  CONFIRM END
-    # ─────────────────────────────────────────
-    def _build_confirm_end(self) -> tk.Frame:
-        f = tk.Frame(self, bg=BG)
-        f._status_bar = StatusBar(f)
-        f._status_bar.pack(fill="x", side="top")
+    def _set_mode(self, mode: str, silent: bool = False):
+        self.led_mode = mode
+        self.btn_rgb.config(bg=BTN_ACTIVE if mode == M_RGB  else BTN_IDLE)
+        self.btn_ir .config(bg=BTN_ACTIVE if mode == M_IR   else BTN_IDLE)
+        self.btn_nbi.config(bg=BTN_ACTIVE if mode == M_NBI  else BTN_IDLE)
+        if not silent and self.stm.connected:
+            threading.Thread(
+                target=self.stm.set_preview_leds,
+                args=(mode, PREVIEW_DUTY),
+                daemon=True,
+            ).start()
 
-        center = tk.Frame(f, bg=BG)
-        center.pack(expand=True)
+    # ─────────────────────────────────────────────────────────────────────────
+    # BUILD: FINISH CONFIRM
+    # ─────────────────────────────────────────────────────────────────────────
 
-        card = tk.Frame(center, bg=CARD_BG, padx=40, pady=30)
-        card.pack(padx=60, pady=20)
+    def _build_finish_confirm(self):
+        f = tk.Frame(self.root, bg=BG)
+        self.frames["finish_confirm"] = f
 
-        tk.Label(card, text=f'ID пациента: "{self.patient_id}"',
-                 font=self.fn_big, bg=CARD_BG, fg=TEXT_W).pack()
-        tk.Label(card, text="Завершить съёмку?",
-                 font=self.fn_big, bg=CARD_BG, fg=TEXT_D).pack(pady=(20, 0))
+        self.finish_warn = tk.Label(f, text="", fg=WARN_COL, bg=BG,
+                                     font=("DejaVu Sans", 12))
+        self.finish_warn.place(x=10, y=6)
 
-        btn_row = tk.Frame(center, bg=BG)
-        btn_row.pack(pady=20)
+        card = tk.Frame(f, bg=CARD_BG, bd=0)
+        card.place(relx=0.5, rely=0.33, anchor="center", width=720, height=210)
 
-        RoundButton(btn_row, text="✕", bg=RED_BTN, fg=TEXT_W,
-                    font=self.fn_big, width=100, height=80,
-                    command=self._back_to_main).pack(side="left", padx=20)
+        tk.Label(card,
+                 text=f'ID пациента:  "{PATIENT_ID}"',
+                 font=("DejaVu Sans", 34, "bold"),
+                 bg=CARD_BG, fg=CARD_FG,
+                 ).place(relx=0.5, rely=0.30, anchor="center")
 
-        RoundButton(btn_row, text="✓", bg=GREEN_BTN, fg=TEXT_W,
-                    font=self.fn_big, width=100, height=80,
-                    command=self._go_task).pack(side="left", padx=20)
+        tk.Label(card,
+                 text="Завершить съёмку?",
+                 font=("DejaVu Sans", 28),
+                 bg=CARD_BG, fg=CARD_FG,
+                 ).place(relx=0.5, rely=0.68, anchor="center")
 
-        return f
+        tk.Button(f, text="✗",
+                  font=("DejaVu Sans", 52, "bold"),
+                  bg=BTN_IDLE, fg=BTN_DANGER,
+                  activebackground=BTN_IDLE, activeforeground=BTN_DANGER,
+                  relief="flat", bd=0, highlightthickness=0,
+                  cursor="hand2",
+                  command=self._finish_cancel,
+                  ).place(relx=0.63, rely=0.76, anchor="center", width=140, height=120)
 
-    def _ask_finish(self):
-        self._preview_stop()
-        if self.stm:
-            self.stm.all_leds_off()
-        self._show_screen("confirm_end")
+        tk.Button(f, text="✓",
+                  font=("DejaVu Sans", 52, "bold"),
+                  bg=BTN_IDLE, fg=BTN_OK,
+                  activebackground=BTN_IDLE, activeforeground=BTN_OK,
+                  relief="flat", bd=0, highlightthickness=0,
+                  cursor="hand2",
+                  command=self._finish_ok,
+                  ).place(relx=0.83, rely=0.76, anchor="center", width=140, height=120)
 
-    def _back_to_main(self):
-        self._show_screen("main")
-        self._preview_start()
-        if self.stm:
-            self.stm.set_group(self.light_group.get(), PREVIEW_DUTY)
+    def _show_finish_confirm(self):
+        self._show("finish_confirm")
+        self._refresh_warn_labels()
 
-    def _go_task(self):
-        self._show_screen("task")
+    def _finish_cancel(self):
+        self._show_main()
 
-    # ─────────────────────────────────────────
-    #  CAPTURING SCREEN
-    # ─────────────────────────────────────────
-    def _build_capturing(self) -> tk.Frame:
-        f = tk.Frame(self, bg=BG)
-        f._status_bar = None
-        tk.Label(f, text="⏺", font=tkfont.Font(size=64),
-                 bg=BG, fg=RED_BTN).pack(expand=True, pady=(60, 0))
-        tk.Label(f, text="Идёт съёмка…", font=self.fn_big,
-                 bg=BG, fg=TEXT_W).pack()
-        self._capture_progress = tk.Label(f, text="", font=self.fn_med,
-                                           bg=BG, fg=ACCENT)
-        self._capture_progress.pack(pady=10)
-        return f
+    def _finish_ok(self):
+        self._stop_cam_preview()
+        threading.Thread(target=self.stm.all_off, daemon=True).start()
+        self._show_task_select()
 
-    def _start_capture(self):
-        if self._current_screen() != "main":
-            return
-        self._preview_stop()
-        if self.stm:
-            self.stm.all_leds_off()
-        self._show_screen("capturing")
-        self.captured_images = []
-        threading.Thread(target=self._do_capture, daemon=True).start()
+    # ─────────────────────────────────────────────────────────────────────────
+    # BUILD: CAPTURING
+    # ─────────────────────────────────────────────────────────────────────────
 
-    def _do_capture(self):
-        if self.cam and self.cam.available:
+    def _build_capturing(self):
+        f = tk.Frame(self.root, bg=BG)
+        self.frames["capturing"] = f
+
+        tk.Label(f, text="Идёт съёмка…",
+                 font=("DejaVu Sans", 46, "bold"),
+                 fg=ACCENT_GRN, bg=BG,
+                 ).place(relx=0.5, rely=0.38, anchor="center")
+
+        self.cap_progress = tk.Label(f, text="",
+                                      font=("DejaVu Sans", 22),
+                                      fg=TEXT_DIM, bg=BG)
+        self.cap_progress.place(relx=0.5, rely=0.60, anchor="center")
+
+        self.cap_led_lbl = tk.Label(f, text="",
+                                     font=("DejaVu Sans", 18),
+                                     fg="#7B9A2A", bg=BG)
+        self.cap_led_lbl.place(relx=0.5, rely=0.72, anchor="center")
+
+    def _shutter_pressed(self):
+        if self.screen == "main":
+            self._begin_capture()
+
+    def _begin_capture(self):
+        self._stop_cam_preview()
+        threading.Thread(target=self.stm.all_off, daemon=True).start()
+        self._show("capturing")
+        self.cap_progress.config(text="Подготовка…")
+        self.cap_led_lbl.config(text="")
+        threading.Thread(target=self._capture_sequence, daemon=True).start()
+
+    def _capture_sequence(self):
+        images = []
+
+        if CAM_OK and self.cam:
             try:
-                from picamera2 import Picamera2
-                self.cam._apply_controls(preview=False)
-                time.sleep(0.3)
-                # Discard frames
-                for _ in range(3):
-                    req = self.cam.cam.capture_request()
-                    req.release()
+                # Reconfigure for still
+                self.cam.stop()
+                still_cfg = self.cam.create_still_configuration(
+                    main={"size": (1280, 720), "format": "RGB888"}
+                )
+                self.cam.configure(still_cfg)
+                self.cam.set_controls({
+                    "AeEnable":    False,
+                    "AwbEnable":   False,
+                    "ExposureTime": 1000,
+                    "AnalogueGain": 1.1,
+                    "ColourGains":  (1.0, 1.0),
+                    "AfMode":      libcontrols.AfModeEnum.Manual,
+                    "LensPosition": 12.0,
+                })
+                self.cam.start()
+                self.cam_running = True
+                time.sleep(0.4)
 
-                for idx, (led, wl, duty) in enumerate(LED_TABLE):
-                    self.after(0, lambda i=idx, n=len(LED_TABLE):
-                               self._capture_progress.configure(
-                                   text=f"Снимок {i+1} / {n}  ({wl} нм)"))
-                    if self.stm:
+                for i, (led, wl, duty) in enumerate(LED_TABLE):
+                    msg = f"Снимок {i+1} / {len(LED_TABLE)}  —  {wl} нм"
+                    self.root.after(0, lambda m=msg: self.cap_progress.config(text=m))
+                    lmsg = f"LED {led}  ·  {duty}% PWM"
+                    self.root.after(0, lambda m=lmsg: self.cap_led_lbl.config(text=m))
+
+                    if self.stm.connected:
                         self.stm.led_duty(led, duty)
                         self.stm.led_on(led)
-                    time.sleep(0.005)
+                        time.sleep(0.05)
 
-                    # Discard 3
+                    # Discard frames
                     for _ in range(3):
-                        req = self.cam.cam.capture_request()
+                        req = self.cam.capture_request()
                         req.release()
 
-                    req = self.cam.cam.capture_request()
+                    # Capture
+                    req = self.cam.capture_request()
                     buf = io.BytesIO()
                     req.save("main", buf, format="jpeg")
                     req.release()
-                    self.captured_images.append((wl, buf.getvalue()))
 
-                    if self.stm:
+                    if self.stm.connected:
                         self.stm.led_off(led)
 
+                    buf.seek(0)
+                    img = Image.open(buf)
+                    img.load()
+                    images.append((wl, img.copy()))
+
+                self.cam.stop()
+                self.cam_running = False
+
             except Exception as e:
-                print(f"[CAPTURE] Error: {e}")
+                print(f"Capture error: {e}")
+                images = self._dummy_images()
         else:
-            # Simulate for demo
-            for idx, (led, wl, duty) in enumerate(LED_TABLE):
-                self.after(0, lambda i=idx, n=len(LED_TABLE):
-                           self._capture_progress.configure(
-                               text=f"Снимок {i+1} / {n}  ({wl} нм)"))
-                # Create a colored placeholder
-                color = (
-                    int(450 + (wl - 450) * 0.3),
-                    int(100 + (wl - 450) * 0.1),
-                    int(50)
-                )
-                img = Image.new("RGB", (640, 480), color)
-                buf = io.BytesIO()
-                img.save(buf, format="jpeg")
-                self.captured_images.append((wl, buf.getvalue()))
-                time.sleep(0.3)
+            images = self._dummy_images()
 
-        self.after(0, self._show_photo_preview)
+        self.captures  = images
+        self.prev_idx  = 0
+        self.root.after(0, self._show_preview_screen)
 
-    # ─────────────────────────────────────────
-    #  PHOTO PREVIEW SCREEN
-    # ─────────────────────────────────────────
-    def _build_preview_photos(self) -> tk.Frame:
-        f = tk.Frame(self, bg=BG)
-        f._status_bar = StatusBar(f)
-        f._status_bar.pack(fill="x", side="top")
-
-        body = tk.Frame(f, bg=BG)
-        body.pack(fill="both", expand=True)
-
-        # Photo canvas (left)
-        self._photo_canvas = tk.Canvas(body, width=560, height=380,
-                                        bg="#0a0a0a", highlightthickness=0)
-        self._photo_canvas.pack(side="left", padx=10, pady=10)
-        self._photo_img_ref = None
-
-        # Right controls
-        right = tk.Frame(body, bg=BG, width=210)
-        right.pack(side="right", fill="y", padx=(5, 10), pady=10)
-        right.pack_propagate(False)
-
-        # Wavelength label
-        self._wl_label = tk.Label(right, text="450 нм", font=self.fn_title,
-                                   bg=BG, fg=ACCENT)
-        self._wl_label.pack(pady=(10, 0))
-
-        self._photo_idx_label = tk.Label(right, text="1 / 8",
-                                          font=self.fn_small, bg=BG, fg="#888")
-        self._photo_idx_label.pack()
-
-        nav = tk.Frame(right, bg=BG)
-        nav.pack(pady=10)
-        RoundButton(nav, text="◀", bg=GRAY_BTN, fg=TEXT_W,
-                    font=self.fn_big, width=88, height=70,
-                    command=self._photo_prev).pack(side="left", padx=4)
-        RoundButton(nav, text="▶", bg=GRAY_BTN, fg=TEXT_W,
-                    font=self.fn_big, width=88, height=70,
-                    command=self._photo_next).pack(side="left", padx=4)
-
-        tk.Frame(right, bg=BG, height=20).pack()
-        tk.Label(right, text="Сохранить?", font=self.fn_small,
-                 bg=BG, fg="#888").pack()
-
-        btn_row2 = tk.Frame(right, bg=BG)
-        btn_row2.pack(pady=8)
-        RoundButton(btn_row2, text="✕", bg=RED_BTN, fg=TEXT_W,
-                    font=self.fn_big, width=88, height=70,
-                    command=self._discard_photos).pack(side="left", padx=4)
-        RoundButton(btn_row2, text="✓", bg=GREEN_BTN, fg=TEXT_W,
-                    font=self.fn_big, width=88, height=70,
-                    command=self._discard_photos).pack(side="left", padx=4)
-
-        return f
-
-    def _show_photo_preview(self):
-        self.preview_idx = 0
-        self._show_screen("preview_photos")
-        self._render_photo()
-
-    def _render_photo(self):
-        if not self.captured_images:
-            return
-        idx = self.preview_idx % len(self.captured_images)
-        wl, data = self.captured_images[idx]
-        img = Image.open(io.BytesIO(data)).resize((560, 380), Image.LANCZOS)
-        tk_img = pil_to_tk(img)
-        self._photo_canvas.delete("all")
-        self._photo_canvas.create_image(0, 0, anchor="nw", image=tk_img)
-        self._photo_img_ref = tk_img
-        self._wl_label.configure(text=f"{wl} нм")
-        self._photo_idx_label.configure(
-            text=f"{idx+1} / {len(self.captured_images)}")
-
-    def _photo_prev(self):
-        self.preview_idx = (self.preview_idx - 1) % max(1, len(self.captured_images))
-        self._render_photo()
-
-    def _photo_next(self):
-        self.preview_idx = (self.preview_idx + 1) % max(1, len(self.captured_images))
-        self._render_photo()
-
-    def _discard_photos(self):
-        self.captured_images = []
-        self._show_screen("main")
-        self._preview_start()
-        if self.stm:
-            self.stm.set_group(self.light_group.get(), PREVIEW_DUTY)
-
-    # ─────────────────────────────────────────
-    #  QUIT
-    # ─────────────────────────────────────────
-    def _quit(self):
-        self._preview_stop()
-        if self.stm:
-            self.stm.close()
-        if self.cam:
-            self.cam.stop()
-        self.destroy()
-
-
-# ─────────────────────────────────────────
-#  STATUS BAR WIDGET
-# ─────────────────────────────────────────
-class StatusBar(tk.Frame):
-    def __init__(self, parent, **kwargs):
-        super().__init__(parent, bg=PANEL_BG, height=32, **kwargs)
-        self.pack_propagate(False)
-
-        self._stm_label = tk.Label(self, text="", font=tkfont.Font(size=11),
-                                    bg=PANEL_BG, fg="#F44336")
-        self._stm_label.pack(side="left", padx=8)
-
-        self._bat_canvas = tk.Canvas(self, width=70, height=30,
-                                      bg=PANEL_BG, highlightthickness=0)
-        self._bat_canvas.pack(side="right", padx=8)
-        self._bat_img_ref = None
-        self.update_status(75, False, True)
-
-    def update_status(self, level: int, charging: bool, stm_ok: bool):
-        self._stm_label.configure(
-            text="" if stm_ok else "⚠ Контроллер отключён")
-        img = make_bat_icon(level, charging, size=(60, 26))
-        tk_img = pil_to_tk(img)
-        self._bat_canvas.delete("all")
-        self._bat_canvas.create_image(5, 2, anchor="nw", image=tk_img)
-        self._bat_img_ref = tk_img
-
-
-# ─────────────────────────────────────────
-#  ROUNDED BUTTON WIDGET
-# ─────────────────────────────────────────
-class RoundButton(tk.Canvas):
-    def __init__(self, parent, text, bg, fg, font, width, height,
-                 command=None, radius=14, **kwargs):
-        super().__init__(parent, width=width, height=height,
-                         bg=parent["bg"], highlightthickness=0, **kwargs)
-        self._bg = bg
-        self._fg = fg
-        self._text = text
-        self._font = font
-        self._radius = radius
-        self._command = command
-        self._draw()
-        self.bind("<Button-1>", self._on_click)
-        self.bind("<ButtonRelease-1>", self._on_release)
-
-    def _draw(self, pressed=False):
-        self.delete("all")
-        w = int(self["width"])
-        h = int(self["height"])
-        r = self._radius
-        bg = self._darken(self._bg) if pressed else self._bg
-        # Rounded rect via polygon
-        pts = [
-            r, 0,
-            w-r, 0,
-            w, r,
-            w, h-r,
-            w-r, h,
-            r, h,
-            0, h-r,
-            0, r,
+    def _dummy_images(self):
+        """Synthetic images for testing without camera."""
+        imgs = []
+        colors = [
+            (30, 60, 200),   # 450 blue
+            (20, 180, 60),   # 520 green
+            (200, 40, 40),   # 670 red
+            (140, 60, 140),  # 780
+            (150, 70, 110),  # 800
+            (130, 80, 90),   # 850
+            (110, 90, 70),   # 890
+            (90, 100, 50),   # 940
         ]
-        self.create_polygon(pts, smooth=True, fill=bg, outline="")
-        self.create_text(w//2, h//2, text=self._text,
-                         fill=self._fg, font=self._font)
+        for (led, wl, duty), col in zip(LED_TABLE, colors):
+            img = Image.new("RGB", (640, 480), color=col)
+            if PIL_OK:
+                draw = ImageDraw.Draw(img)
+                draw.text((20, 20), f"{wl} nm  LED{led}", fill=(255, 255, 255))
+            imgs.append((wl, img))
+            time.sleep(0.25)
+        return imgs
 
-    def _darken(self, hex_color: str) -> str:
-        try:
-            r = int(hex_color[1:3], 16)
-            g = int(hex_color[3:5], 16)
-            b = int(hex_color[5:7], 16)
-            return f"#{max(r-30,0):02x}{max(g-30,0):02x}{max(b-30,0):02x}"
-        except Exception:
-            return hex_color
+    # ─────────────────────────────────────────────────────────────────────────
+    # BUILD: PHOTO PREVIEW
+    # ─────────────────────────────────────────────────────────────────────────
 
-    def _on_click(self, e):
-        self._draw(pressed=True)
+    def _build_preview(self):
+        f = tk.Frame(self.root, bg=BG)
+        self.frames["preview"] = f
 
-    def _on_release(self, e):
-        self._draw(pressed=False)
-        if self._command:
-            self._command()
+        # Photo display
+        self.prev_photo_lbl = tk.Label(f, bg="#0A0A0A",
+                                        text="",
+                                        fg=TEXT_DIM,
+                                        font=("DejaVu Sans", 14))
+        self.prev_photo_lbl.place(x=0, y=0, width=PREVIEW_W, height=H)
 
-    def configure(self, **kw):
-        if "bg" in kw:
-            self._bg = kw.pop("bg")
-        super().configure(**kw)
-        self._draw()
+        # ── Right panel ────────────────────────────────────────────────────
+        px, pw = PANEL_X, PANEL_W
+        HALF   = (pw - 8) // 2
+
+        # Wavelength
+        self.prev_wl_lbl = tk.Label(f, text="450 нм",
+                                     font=("DejaVu Sans", 26, "bold"),
+                                     fg=TEXT_WHITE, bg=BG)
+        self.prev_wl_lbl.place(x=px, y=10, width=pw, height=44)
+
+        self.prev_cnt_lbl = tk.Label(f, text="1 / 8",
+                                      font=("DejaVu Sans", 16),
+                                      fg=TEXT_DIM, bg=BG)
+        self.prev_cnt_lbl.place(x=px, y=56, width=pw, height=28)
+
+        # Navigation row  ◀  ▶
+        tk.Button(f, text="◀",
+                  font=("DejaVu Sans", 34, "bold"),
+                  bg=BTN_IDLE, fg="#333333",
+                  activebackground=BTN_IDLE, activeforeground="#333333",
+                  relief="flat", bd=0, highlightthickness=0,
+                  cursor="hand2",
+                  command=self._prev_left,
+                  ).place(x=px, y=96, width=HALF, height=100)
+
+        tk.Button(f, text="▶",
+                  font=("DejaVu Sans", 34, "bold"),
+                  bg=BTN_IDLE, fg="#333333",
+                  activebackground=BTN_IDLE, activeforeground="#333333",
+                  relief="flat", bd=0, highlightthickness=0,
+                  cursor="hand2",
+                  command=self._prev_right,
+                  ).place(x=px + HALF + 8, y=96, width=HALF, height=100)
+
+        # Brightness row  −  +
+        tk.Button(f, text="−",
+                  font=("DejaVu Sans", 34, "bold"),
+                  bg=BTN_IDLE, fg="#333333",
+                  activebackground=BTN_IDLE, activeforeground="#333333",
+                  relief="flat", bd=0, highlightthickness=0,
+                  cursor="hand2",
+                  command=self._prev_left,   # repurposed for nav in test version
+                  ).place(x=px, y=208, width=HALF, height=100)
+
+        tk.Button(f, text="+",
+                  font=("DejaVu Sans", 34, "bold"),
+                  bg=BTN_IDLE, fg="#333333",
+                  activebackground=BTN_IDLE, activeforeground="#333333",
+                  relief="flat", bd=0, highlightthickness=0,
+                  cursor="hand2",
+                  command=self._prev_right,  # repurposed for nav in test version
+                  ).place(x=px + HALF + 8, y=208, width=HALF, height=100)
+
+        # Delete / Save row
+        tk.Button(f, text="✗",
+                  font=("DejaVu Sans", 46, "bold"),
+                  bg=BTN_IDLE, fg=BTN_DANGER,
+                  activebackground=BTN_IDLE, activeforeground=BTN_DANGER,
+                  relief="flat", bd=0, highlightthickness=0,
+                  cursor="hand2",
+                  command=self._prev_discard,
+                  ).place(x=px, y=322, width=HALF, height=140)
+
+        tk.Button(f, text="✓",
+                  font=("DejaVu Sans", 46, "bold"),
+                  bg=BTN_IDLE, fg=BTN_OK,
+                  activebackground=BTN_IDLE, activeforeground=BTN_OK,
+                  relief="flat", bd=0, highlightthickness=0,
+                  cursor="hand2",
+                  command=self._prev_save,
+                  ).place(x=px + HALF + 8, y=322, width=HALF, height=140)
+
+    def _show_preview_screen(self):
+        self._show("preview")
+        self._refresh_preview_image()
+
+    def _refresh_preview_image(self):
+        if not self.captures:
+            return
+        wl, img = self.captures[self.prev_idx]
+        copy = img.copy()
+        copy.thumbnail((PREVIEW_W, H), Image.LANCZOS)
+        ph = ImageTk.PhotoImage(copy)
+        self._photo_cache["prev_img"] = ph
+        self.prev_photo_lbl.config(image=ph)
+        self.prev_photo_lbl.image = ph
+        self.prev_wl_lbl.config(text=f"{wl} нм")
+        self.prev_cnt_lbl.config(text=f"{self.prev_idx + 1} / {len(self.captures)}")
+
+    def _prev_left(self):
+        if self.captures:
+            self.prev_idx = (self.prev_idx - 1) % len(self.captures)
+            self._refresh_preview_image()
+
+    def _prev_right(self):
+        if self.captures:
+            self.prev_idx = (self.prev_idx + 1) % len(self.captures)
+            self._refresh_preview_image()
+
+    def _prev_discard(self):
+        self._return_to_main()
+
+    def _prev_save(self):
+        # Test version: discard as well (no real saving)
+        self._return_to_main()
+
+    def _return_to_main(self):
+        self.captures = []
+        # Re-init camera for preview mode
+        if CAM_OK and self.cam:
+            try:
+                prev_cfg = self.cam.create_preview_configuration(
+                    main={"size": (640, 480), "format": "RGB888"}
+                )
+                self.cam.configure(prev_cfg)
+                self.cam.set_controls({
+                    "AeEnable":  True,
+                    "AwbEnable": True,
+                })
+            except Exception as e:
+                print(f"Camera reconfig: {e}")
+        self._show_main()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # BOOT
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _boot(self):
+        """Decide first screen based on charging state."""
+        if self.charging in (1, 2):
+            self._show_splash()
+        else:
+            self._show_splash()
+            # Wait 1.5 s on splash, then go to task select
+            self.root.after(1500, self._show_task_select)
 
 
-# ─────────────────────────────────────────
-#  ENTRY POINT
-# ─────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
-    app = HyperspectRus()
-    app.mainloop()
+    App()
