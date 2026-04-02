@@ -5,7 +5,70 @@ Raspberry Pi Zero + Picamera2 + STM32 + 800x480 touchscreen
 """
 
 import os
-os.environ.setdefault('DISPLAY', ':0')
+import subprocess
+import glob
+
+# ── Display / XAUTHORITY auto-detection ──────────────────────────────────────
+# Must happen BEFORE any tkinter import.
+
+def _setup_display():
+    # 1. If DISPLAY already set and non-empty — trust it
+    if os.environ.get("DISPLAY", "").strip():
+        return
+
+    # 2. If we're already running as xinit child — just set :0 and continue
+    if "--xinit-child" in sys.argv:
+        os.environ["DISPLAY"] = ":0"
+        return
+
+    # 3. Try to find an already-running X server
+    for disp in (":0", ":0.0", ":1"):
+        os.environ["DISPLAY"] = disp
+        try:
+            r = subprocess.run(
+                ["xdpyinfo", "-display", disp],
+                capture_output=True, timeout=1
+            )
+            if r.returncode == 0:
+                return
+        except Exception:
+            pass
+
+    # 4. No X server found — relaunch self via xinit
+    #    xinit will start Xorg and then run this script as its only client.
+    xinit_path = subprocess.run(["which", "xinit"],
+                                capture_output=True).stdout.decode().strip()
+    if xinit_path:
+        print("No DISPLAY found — relaunching via xinit...")
+        os.execv(xinit_path, [
+            xinit_path,
+            sys.executable, os.path.abspath(sys.argv[0]), "--xinit-child",
+            "--", ":0", "vt1",
+        ])
+        # os.execv replaces the process; we never reach here
+
+    # 5. Last resort — set :0 and let Tk fail with a readable error
+    os.environ["DISPLAY"] = ":0"
+
+def _setup_xauthority():
+    if os.environ.get("XAUTHORITY", "").strip():
+        return
+    # Check common locations for .Xauthority
+    candidates = [
+        os.path.expanduser("~/.Xauthority"),
+        "/home/pi/.Xauthority",
+        "/run/user/1000/gdm/Xauthority",
+    ]
+    # Also search via glob for any runtime Xauthority
+    candidates += glob.glob("/tmp/.xauth*")
+    candidates += glob.glob("/run/user/*/.Xauthority")
+    for path in candidates:
+        if os.path.exists(path):
+            os.environ["XAUTHORITY"] = path
+            return
+
+_setup_display()
+_setup_xauthority()
 
 import tkinter as tk
 from tkinter import font as tkfont
@@ -687,15 +750,15 @@ class App:
         self._show("main")
         self._refresh_warn_labels()
         self._refresh_battery_display()
-        self._set_mode(self.led_mode, silent=True)
+        self._set_mode(self.led_mode)   # always turn on LEDs immediately
         self._start_cam_preview()
 
-    def _set_mode(self, mode: str, silent: bool = False):
+    def _set_mode(self, mode: str):
         self.led_mode = mode
-        self.btn_rgb.config(bg=BTN_ACTIVE if mode == M_RGB  else BTN_IDLE)
-        self.btn_ir .config(bg=BTN_ACTIVE if mode == M_IR   else BTN_IDLE)
-        self.btn_nbi.config(bg=BTN_ACTIVE if mode == M_NBI  else BTN_IDLE)
-        if not silent and self.stm.connected:
+        for btn, m in [(self.btn_rgb, M_RGB), (self.btn_ir, M_IR), (self.btn_nbi, M_NBI)]:
+            c = BTN_ACTIVE if mode == m else BTN_IDLE
+            btn.config(bg=c, activebackground=c)
+        if self.stm.connected:
             threading.Thread(
                 target=self.stm.set_preview_leds,
                 args=(mode, PREVIEW_DUTY),
