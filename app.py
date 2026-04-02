@@ -317,6 +317,7 @@ class App:
         self.root.attributes("-fullscreen", True)
         self.root.resizable(False, False)
         self.root.option_add("*tearOff", False)
+        self.root.config(cursor="none")
 
         # ── Fonts ────────────────────────────────────────────────────────────
         self.fnt_xl   = tkfont.Font(family="DejaVu Sans", size=40, weight="bold")
@@ -359,33 +360,28 @@ class App:
         try:
             self.cam = Picamera2()
 
-            # Основная конфигурация — фиксированная, как при съёмке
-            self.fixed_config = self.cam.create_preview_configuration(
+            # ЕДИНАЯ конфигурация для превью И съёмки (1280x720)
+            self.fixed_config = self.cam.create_still_configuration(
                 main={
-                    "size": (1280, 720),      # или (1640, 1232) / (1920, 1080) — выбирай то, что тебе нужно
+                    "size": (1280, 720),
                     "format": "RGB888"
-                },
-                # lores можно добавить, если нужно отдельный низкоразрешающий поток, но обычно не обязательно
+                }
             )
 
             self.cam.configure(self.fixed_config)
 
-            # Фиксируем все нужные параметры один раз
+            # Фиксируем все параметры один раз (как ты хотел)
             self.cam.set_controls({
-                "AeEnable": False,           # выключаем автоэкспозицию
-                "AwbEnable": False,          # выключаем автобаланс белого
-                "ExposureTime": 1000,        # 1000 мкс = 1 мс (подбери под свои условия)
-                "AnalogueGain": 1.1,         # можно увеличить до 2.0–4.0 при слабом освещении
-                "ColourGains": (1.0, 1.0),   # фиксируем gains для R и B (если AwbEnable=False)
+                "AeEnable": False,
+                "AwbEnable": False,
+                "ExposureTime": 1000,        # подбери под свои условия
+                "AnalogueGain": 1.1,
+                "ColourGains": (1.0, 1.0),
                 "AfMode": libcontrols.AfModeEnum.Manual,
-                "LensPosition": 12.0,        # фиксированный фокус (подбери значение под свой объектив)
-                # Дополнительно можно добавить:
-                # "Brightness": 0.0,
-                # "Contrast": 1.0,
-                # "Saturation": 1.0,
+                "LensPosition": 12.0,
             })
 
-            print("Камера инициализирована с фиксированными параметрами")
+            print("Камера инициализирована с фиксированными параметрами (1280x720)")
         except Exception as e:
             print(f"Camera init error: {e}")
             self.cam = None
@@ -419,15 +415,19 @@ class App:
         if self.screen != "main" or not self.cam_running:
             return
         try:
-            arr  = self.cam.capture_array()
-            img  = Image.fromarray(arr)
-            img  = img.resize((PREVIEW_W, H - STATUS_H), Image.NEAREST)
-            ph   = ImageTk.PhotoImage(img)
+            arr = self.cam.capture_array()
+            img = Image.fromarray(arr)
+
+            # Сохраняем пропорции (как в просмотре снимков)
+            copy = img.copy()
+            copy.thumbnail((PREVIEW_W, H - STATUS_H), Image.LANCZOS)
+            ph = ImageTk.PhotoImage(copy)
+
             self.main_prev_lbl.config(image=ph, text="")
             self.main_prev_lbl.image = ph
         except Exception:
             pass
-        self._preview_job = self.root.after(80, self._do_preview_frame)  # ~12 fps
+        self._preview_job = self.root.after(80, self._do_preview_frame)
 
     # ─────────────────────────────────────────────────────────────────────────
     # BATTERY BACKGROUND THREAD
@@ -477,7 +477,7 @@ class App:
 
     def _refresh_battery_display(self):
         icon_name = battery_icon_name(self.battery_pct, self.charging)
-        ph = load_asset(icon_name, size=(52, 26))
+        ph = load_asset(icon_name, size=(78, 38))
         if ph:
             self._photo_cache["bat_icon"] = ph
             for lbl in [getattr(self, n, None) for n in
@@ -523,7 +523,7 @@ class App:
         self.frames["splash"] = f
 
         self.splash_logo_lbl = tk.Label(f, bg=BG)
-        self.splash_logo_lbl.place(relx=0.5, rely=0.36, anchor="center")
+        self.splash_logo_lbl.place(relx=0.5, rely=0.30, anchor="center")
 
         self.splash_bat_lbl = tk.Label(f, bg=BG)
         self.splash_bat_lbl.place(relx=0.5, rely=0.68, anchor="center")
@@ -535,7 +535,7 @@ class App:
         self._show("splash")
 
         # Logo
-        logo_ph = load_asset("logo.png", size=(280, 160))
+        logo_ph = load_asset("logo.png", size=(420, 240))
         if logo_ph:
             self._photo_cache["logo"] = logo_ph
             self.splash_logo_lbl.config(image=logo_ph, text="")
@@ -646,7 +646,7 @@ class App:
 
         self.main_bat_lbl = tk.Label(sb, text="", fg=TEXT_WHITE, bg=STATUS_BG,
                                       font=("DejaVu Sans", 10))
-        self.main_bat_lbl.place(x=W - 80, y=3)
+        self.main_bat_lbl.place(x=W - 105, y=1)
 
         # ── Camera preview ────────────────────────────────────────────────────
         self.main_prev_lbl = tk.Label(f, bg="#0A0A0A",
@@ -815,21 +815,7 @@ class App:
 
         if CAM_OK and self.cam:
             try:
-                # Reconfigure for still
-                self.cam.stop()
-                still_cfg = self.cam.create_still_configuration(
-                    main={"size": (1280, 720), "format": "RGB888"}
-                )
-                self.cam.configure(still_cfg)
-                self.cam.set_controls({
-                    "AeEnable":    False,
-                    "AwbEnable":   False,
-                    "ExposureTime": 1000,
-                    "AnalogueGain": 1.1,
-                    "ColourGains":  (1.0, 1.0),
-                    "AfMode":      libcontrols.AfModeEnum.Manual,
-                    "LensPosition": 12.0,
-                })
+                # Используем уже настроенную конфигурацию — ничего не переключаем
                 self.cam.start()
                 self.cam_running = True
                 time.sleep(0.4)
@@ -843,14 +829,14 @@ class App:
                     if self.stm.connected:
                         self.stm.led_duty(led, duty)
                         self.stm.led_on(led)
-                        time.sleep(0.05)
+                        time.sleep(0.08)
 
                     # Discard frames
                     for _ in range(3):
                         req = self.cam.capture_request()
                         req.release()
 
-                    # Capture
+                    # Захват
                     req = self.cam.capture_request()
                     buf = io.BytesIO()
                     req.save("main", buf, format="jpeg")
@@ -872,7 +858,6 @@ class App:
                 images = self._dummy_images()
         else:
             images = self._dummy_images()
-
         self.captures  = images
         self.prev_idx  = 0
         self.root.after(0, self._show_preview_screen)
