@@ -61,6 +61,9 @@ PANEL_X     = PREVIEW_W + 8
 PANEL_W     = W - PREVIEW_W - 16
 STATUS_H    = 34
 
+# ── Camera preview ───────────────────────────────────────────────────────────
+PREVIEW_FPS = 30
+
 # LED config  (led_index, wavelength_nm, capture_duty%)
 LED_TABLE = [
     (1, 450, 100),
@@ -86,7 +89,7 @@ STATUS_BG   = "#000000"
 CARD_BG     = "#D4D4D4"
 CARD_FG     = "#1A1A1A"
 BTN_IDLE    = "#CECECE"
-BTN_ACTIVE  = "#6E9B1E"   # olive green
+BTN_ACTIVE  = "#6E9B1E"
 BTN_FINISH  = "#767676"
 BTN_DANGER  = "#B03030"
 BTN_OK      = "#4A8A18"
@@ -226,7 +229,7 @@ class STM32:
             self.led_duty(8, duty)
             self.led_on(8)
         elif mode == M_NBI:
-            for led in [2, 3]:
+            for led in [1, 3]:
                 self.led_duty(led, duty)
                 self.led_on(led)
 
@@ -281,6 +284,23 @@ def make_button(parent, text, font_obj, bg, fg, cmd, **place_kw):
     )
     btn.place(**place_kw)
     return btn
+
+def _resize_to_fill(self, img: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    """Заполняет всю целевую область по высоте, обрезая лишнее слева/справа по центру"""
+    # 1. Вычисляем масштаб, чтобы высота стала ровно target_h
+    scale = target_h / img.height
+    new_w = int(img.width * scale)
+
+    # 2. Сначала ресайзим (с сохранением пропорций)
+    resized = img.resize((new_w, target_h), Image.LANCZOS)
+
+    # 3. Обрезаем по центру до нужной ширины
+    if new_w > target_w:
+        left = (new_w - target_w) // 2
+        right = left + target_w
+        resized = resized.crop((left, 0, right, target_h))
+
+    return resized
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -360,7 +380,6 @@ class App:
         try:
             self.cam = Picamera2()
 
-            # ЕДИНАЯ конфигурация для превью И съёмки (1280x720)
             self.fixed_config = self.cam.create_still_configuration(
                 main={
                     "size": (1280, 720),
@@ -370,18 +389,17 @@ class App:
 
             self.cam.configure(self.fixed_config)
 
-            # Фиксируем все параметры один раз (как ты хотел)
             self.cam.set_controls({
                 "AeEnable": False,
                 "AwbEnable": False,
-                "ExposureTime": 1000,        # подбери под свои условия
+                "ExposureTime": 1000,       
                 "AnalogueGain": 1.1,
                 "ColourGains": (1.0, 1.0),
                 "AfMode": libcontrols.AfModeEnum.Manual,
                 "LensPosition": 12.0,
             })
 
-            print("Камера инициализирована с фиксированными параметрами (1280x720)")
+            print("Camera initialized with fixed parameters (1280x720)")
         except Exception as e:
             print(f"Camera init error: {e}")
             self.cam = None
@@ -418,16 +436,15 @@ class App:
             arr = self.cam.capture_array()
             img = Image.fromarray(arr)
 
-            # Сохраняем пропорции (как в просмотре снимков)
-            copy = img.copy()
-            copy.thumbnail((PREVIEW_W, H - STATUS_H), Image.LANCZOS)
-            ph = ImageTk.PhotoImage(copy)
+            cropped = self._resize_to_fill(img, PREVIEW_W, H - STATUS_H)
+            ph = ImageTk.PhotoImage(cropped)
 
             self.main_prev_lbl.config(image=ph, text="")
             self.main_prev_lbl.image = ph
         except Exception:
             pass
-        self._preview_job = self.root.after(80, self._do_preview_frame)
+        delay_ms = max(1, int(1000 / PREVIEW_FPS)) 
+        self._preview_job = self.root.after(delay_ms, self._do_preview_frame)
 
     # ─────────────────────────────────────────────────────────────────────────
     # BATTERY BACKGROUND THREAD
@@ -976,9 +993,10 @@ class App:
         if not self.captures:
             return
         wl, img = self.captures[self.prev_idx]
-        copy = img.copy()
-        copy.thumbnail((PREVIEW_W, H), Image.LANCZOS)
-        ph = ImageTk.PhotoImage(copy)
+
+        cropped = self._resize_to_fill(img, PREVIEW_W, H)
+        ph = ImageTk.PhotoImage(cropped)
+        
         self._photo_cache["prev_img"] = ph
         self.prev_photo_lbl.config(image=ph)
         self.prev_photo_lbl.image = ph
