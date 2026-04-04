@@ -229,7 +229,7 @@ class STM32:
             self.led_duty(8, duty)
             self.led_on(8)
         elif mode == M_NBI:
-            for led in [1, 3]:
+            for led in [1, 2]:
                 self.led_duty(led, duty)
                 self.led_on(led)
 
@@ -284,24 +284,6 @@ def make_button(parent, text, font_obj, bg, fg, cmd, **place_kw):
     )
     btn.place(**place_kw)
     return btn
-
-def _resize_to_fill(self, img: Image.Image, target_w: int, target_h: int) -> Image.Image:
-    """Заполняет всю целевую область по высоте, обрезая лишнее слева/справа по центру"""
-    # 1. Вычисляем масштаб, чтобы высота стала ровно target_h
-    scale = target_h / img.height
-    new_w = int(img.width * scale)
-
-    # 2. Сначала ресайзим (с сохранением пропорций)
-    resized = img.resize((new_w, target_h), Image.LANCZOS)
-
-    # 3. Обрезаем по центру до нужной ширины
-    if new_w > target_w:
-        left = (new_w - target_w) // 2
-        right = left + target_w
-        resized = resized.crop((left, 0, right, target_h))
-
-    return resized
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN APPLICATION
@@ -403,6 +385,23 @@ class App:
         except Exception as e:
             print(f"Camera init error: {e}")
             self.cam = None
+
+    def _resize_to_fill(self, img: Image.Image, target_w: int, target_h: int) -> Image.Image:
+        """Заполняет всю целевую область по высоте, обрезая лишнее слева/справа по центру"""
+        # 1. Вычисляем масштаб, чтобы высота стала ровно target_h
+        scale = target_h / img.height
+        new_w = int(img.width * scale)
+
+        # 2. Сначала ресайзим (с сохранением пропорций)
+        resized = img.resize((new_w, target_h), Image.LANCZOS)
+
+        # 3. Обрезаем по центру до нужной ширины
+        if new_w > target_w:
+            left = (new_w - target_w) // 2
+            right = left + target_w
+            resized = resized.crop((left, 0, right, target_h))
+
+        return resized
 
     def _start_cam_preview(self):
         if not self.cam or self.cam_running:
