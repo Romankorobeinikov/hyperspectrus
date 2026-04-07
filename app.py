@@ -91,7 +91,7 @@ M_RGB = "rgb"
 M_IR  = "ir"
 M_NBI = "nbi"
 
-PREVIEW_LED_DUTY = 10
+PREVIEW_DUTY = (5, 10, 10, 10, 10, 10, 5, 5) 
 
 # ── Network ──────────────────────────────────────────────────────────────────
 SERVER_HOST = "0.0.0.0"
@@ -222,19 +222,20 @@ class STM32:
         for i in range(1, 9):
             self.led_off(i)
 
-    def set_preview_leds(self, mode: str, duty: int = PREVIEW_LED_DUTY):
+    def set_preview_leds(self, mode: str, duty: int = PREVIEW_DUTY):
         self.all_off()
         if mode == M_RGB:
-            leds = [1, 2, 3]
+            for led in [1, 2, 3]:
+                self.led_duty(led, duty[led-1])
+                self.led_on(led)
         elif mode == M_IR:
-            leds = [7, 8]
+            for led in [7, 8]:
+                self.led_duty(led, duty[led-1])
+                self.led_on(led)
         elif mode == M_NBI:
-            leds = [1, 2]
-        else:
-            leds = []
-        for led in leds:
-            self.led_duty(led, duty)
-            self.led_on(led)
+            for led in [1, 2]:
+                self.led_duty(led, duty[led-1])
+                self.led_on(led)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -362,12 +363,14 @@ class NetworkServer:
             print(f"Send error: {e}")
 
     def send_photos(self, session_dir: Path, patient_id: str, notes: str):
+        """Send all photos from session_dir to connected PC."""
         conn = self._client
         if not conn:
             print("No PC connected — cannot send photos")
             return False
         try:
-            files = sorted(f for f in session_dir.rglob("*") if f.is_file())
+            files = sorted(session_dir.glob("*.*"))
+            # First send metadata
             meta = {
                 "cmd":        "session_start",
                 "patient_id": patient_id,
@@ -379,10 +382,9 @@ class NetworkServer:
 
             for f in files:
                 data = f.read_bytes()
-                rel_path = f.relative_to(session_dir).as_posix()  # "jpeg/450nm.jpg"
                 header = json.dumps({
                     "cmd":      "file",
-                    "filename": rel_path,   # ← относительный путь
+                    "filename": f.name,
                     "size":     len(data),
                 }).encode("utf-8") + b"\n"
                 conn.sendall(header)
@@ -913,7 +915,7 @@ class App:
         if self.stm.connected:
             threading.Thread(
                 target=self.stm.set_preview_leds,
-                args=(mode, PREVIEW_LED_DUTY),
+                args=(mode, PREVIEW_DUTY),
                 daemon=True,
             ).start()
 
@@ -1032,14 +1034,17 @@ class App:
                     self.cam.stop()
                     self.cam_running = False
 
-                # Switch to correct config and apply capture exposure
+                # configure() must be called while camera is stopped
                 cfg = self._cfg_raw if CAPTURE_FORMAT == "raw" else self._cfg_jpeg
                 self.cam.configure(cfg)
-                self._apply_capture_settings()
 
                 self.cam.start()
                 self.cam_running = True
-                time.sleep(0.3)
+
+                # set_controls() must be called AFTER start() to take effect
+                self._apply_capture_settings()
+                # Let the sensor settle with the new exposure
+                time.sleep(0.5)
 
                 for i, (led, wl, duty) in enumerate(LED_TABLE):
                     self.root.after(0, lambda m=f"Снимок {i+1}/{len(LED_TABLE)}  —  {wl} нм":
@@ -1058,7 +1063,7 @@ class App:
                     jpeg_buf = io.BytesIO()
                     req.save("main", jpeg_buf, format="jpeg")
 
-                    # In RAW mode also grab the DNG from raw stream
+                    # In RAW mode use save_dng() — correct picamera2 API for DNG
                     if CAPTURE_FORMAT == "raw":
                         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".dng")
                         try:
@@ -1084,7 +1089,7 @@ class App:
                 self.cam.stop()
                 self.cam_running = False
 
-                # Restore JPEG config for next preview session
+                # Restore JPEG config so preview works on next session
                 self.cam.configure(self._cfg_jpeg)
 
             except Exception as e:
