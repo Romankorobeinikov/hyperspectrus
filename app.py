@@ -361,14 +361,12 @@ class NetworkServer:
             print(f"Send error: {e}")
 
     def send_photos(self, session_dir: Path, patient_id: str, notes: str):
-        """Send all photos from session_dir to connected PC."""
         conn = self._client
         if not conn:
             print("No PC connected — cannot send photos")
             return False
         try:
-            files = sorted(session_dir.glob("*.*"))
-            # First send metadata
+            files = sorted(f for f in session_dir.rglob("*") if f.is_file())
             meta = {
                 "cmd":        "session_start",
                 "patient_id": patient_id,
@@ -380,9 +378,10 @@ class NetworkServer:
 
             for f in files:
                 data = f.read_bytes()
+                rel_path = f.relative_to(session_dir).as_posix()  # "jpeg/450nm.jpg"
                 header = json.dumps({
                     "cmd":      "file",
-                    "filename": f.name,
+                    "filename": rel_path,   # ← относительный путь
                     "size":     len(data),
                 }).encode("utf-8") + b"\n"
                 conn.sendall(header)
