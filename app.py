@@ -361,12 +361,18 @@ class NetworkServer:
             print(f"Send error: {e}")
 
     def send_photos(self, session_dir: Path, patient_id: str, notes: str):
+        """Send all photos from session_dir to connected PC using relative paths."""
         conn = self._client
         if not conn:
             print("No PC connected — cannot send photos")
             return False
         try:
-            files = sorted(f for f in session_dir.rglob("*") if f.is_file())
+            # Wait a moment for any background _save threads to finish writing
+            time.sleep(0.5)
+
+            files = sorted(
+                f for f in session_dir.rglob("*") if f.is_file()
+            )
             meta = {
                 "cmd":        "session_start",
                 "patient_id": patient_id,
@@ -377,16 +383,16 @@ class NetworkServer:
             time.sleep(0.1)
 
             for f in files:
-                data = f.read_bytes()
-                rel_path = f.relative_to(session_dir).as_posix()  # "jpeg/450nm.jpg"
-                header = json.dumps({
+                data     = f.read_bytes()
+                rel_path = f.relative_to(session_dir).as_posix()  # e.g. "jpeg/1/450nm.jpg"
+                header   = json.dumps({
                     "cmd":      "file",
-                    "filename": rel_path,   # ← относительный путь
+                    "filename": rel_path,
                     "size":     len(data),
                 }).encode("utf-8") + b"\n"
                 conn.sendall(header)
                 conn.sendall(data)
-                time.sleep(0.05)
+                time.sleep(0.02)
 
             self._send(conn, {"cmd": "session_end"})
             return True
@@ -638,8 +644,10 @@ class App:
             self._update_wait_pc_label()
 
     def receive_task(self, patient_id: str, notes: str):
-        self.patient_id = patient_id
-        self.notes      = notes
+        self.patient_id  = patient_id
+        self.notes       = notes
+        self.saved_sets  = []
+        self.session_dir = None
         # Update labels
         txt = f'ID пациента: "{patient_id}"'
         for attr in ("task_title", "finish_title"):
@@ -970,17 +978,29 @@ class App:
         """Send all saved photos to PC, then go to waiting screen."""
         self._stop_cam_preview()
         threading.Thread(target=self.stm.all_off, daemon=True).start()
-        if self.saved_sets:
+        if self.session_dir is not None and self.saved_sets:
             threading.Thread(target=self._send_all_photos, daemon=True).start()
         else:
+            self._reset_session()
             self._show_waiting()
 
     def _send_all_photos(self):
-        for sd in self.saved_sets:
-            self.net_server.send_photos(sd, self.patient_id, self.notes)
-            time.sleep(0.2)
-        self.saved_sets.clear()
+        sd = self.session_dir
+        ok = self.net_server.send_photos(sd, self.patient_id, self.notes)
+        if ok:
+            # Delete session folder from Pi to free memory
+            try:
+                import shutil
+                shutil.rmtree(sd, ignore_errors=True)
+                print(f"Deleted local session: {sd}")
+            except Exception as e:
+                print(f"Cleanup error: {e}")
+        self._reset_session()
         self.root.after(0, self._show_waiting)
+
+    def _reset_session(self):
+        self.saved_sets  = []
+        self.session_dir = None
 
     # ─────────────────────────────────────────────────────────────────────────
     # CAPTURE SCREEN
@@ -1196,39 +1216,39 @@ class App:
         self._show_main()
 
     def _prev_save(self):
-        """Save captured images to a timestamped session folder."""
-        ts      = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_id = self.patient_id.replace(" ", "_").replace("/", "_")
-        session = Path("sessions") / f"{safe_id}_{ts}"
-        session.mkdir(parents=True, exist_ok=True)
+        """Save captured images into a numbered set folder inside the patient session."""
+        # One patient session dir per task (created on first save, reused on subsequent)
+        if self.session_dir is None:
+            ts      = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_id = self.patient_id.replace(" ", "_").replace("/", "_")
+            self.session_dir = Path("sessions") / f"{safe_id}_{ts}"
+
+        session = self.session_dir
+
+        # Next set number = how many sets already saved + 1
+        set_num = len(self.saved_sets) + 1
 
         captures_copy = list(self.captures)
         raw_copy      = list(getattr(self, "raw_bufs", []))
 
         def _save():
-            # Always save JPEG (for preview / convenience)
-            jpeg_dir = session / "jpeg"
-            jpeg_dir.mkdir(exist_ok=True)
+            # jpeg/<set_num>/
+            jpeg_set_dir = session / "jpeg" / str(set_num)
+            jpeg_set_dir.mkdir(parents=True, exist_ok=True)
             for wl, img in captures_copy:
-                img.save(jpeg_dir / f"{wl}nm.jpg", format="JPEG", quality=95)
+                img.save(jpeg_set_dir / f"{wl}nm.jpg", format="JPEG", quality=95)
 
-            # In RAW mode also save DNG files
+            # raw/<set_num>/  — only in RAW mode
             if CAPTURE_FORMAT == "raw" and raw_copy:
-                dng_dir = session / "raw"
-                dng_dir.mkdir(exist_ok=True)
+                raw_set_dir = session / "raw" / str(set_num)
+                raw_set_dir.mkdir(parents=True, exist_ok=True)
                 for wl, dng_bytes in raw_copy:
-                    (dng_dir / f"{wl}nm.dng").write_bytes(dng_bytes)
+                    (raw_set_dir / f"{wl}nm.dng").write_bytes(dng_bytes)
 
-            # Notes
-            (session / "notes.txt").write_text(
-                f"Patient: {self.patient_id}\nNotes: {self.notes}\n"
-                f"Format: {CAPTURE_FORMAT}\n",
-                encoding="utf-8",
-            )
-            self.saved_sets.append(session)
-            print(f"Saved session: {session}  (format={CAPTURE_FORMAT})")
+            print(f"Saved set {set_num} → {session}  (format={CAPTURE_FORMAT})")
 
         threading.Thread(target=_save, daemon=True).start()
+        self.saved_sets.append(set_num)   # track count, not path
         self.captures = []
         self.raw_bufs = []
         self._show_main()
