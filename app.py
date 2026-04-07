@@ -10,6 +10,7 @@ import threading
 import time
 import io
 import os
+import tempfile
 import sys
 import json
 import socket
@@ -71,7 +72,7 @@ PREVIEW_EXPOSURE_US  = 15000
 CAPTURE_EXPOSURE_US  = 1000
 
 # ── Format ───────────────────────────────────────────────────────────────────
-CAPTURE_FORMAT = "jpeg"   # "jpeg" or "raw" — change here
+CAPTURE_FORMAT = "raw"   # "jpeg" or "raw" — change here
 
 # ── LED table: (led_index, wavelength_nm, capture_duty%) ─────────────────────
 LED_TABLE = [
@@ -361,14 +362,12 @@ class NetworkServer:
             print(f"Send error: {e}")
 
     def send_photos(self, session_dir: Path, patient_id: str, notes: str):
-        """Send all photos from session_dir to connected PC."""
         conn = self._client
         if not conn:
             print("No PC connected — cannot send photos")
             return False
         try:
-            files = sorted(session_dir.glob("*.*"))
-            # First send metadata
+            files = sorted(f for f in session_dir.rglob("*") if f.is_file())
             meta = {
                 "cmd":        "session_start",
                 "patient_id": patient_id,
@@ -380,9 +379,10 @@ class NetworkServer:
 
             for f in files:
                 data = f.read_bytes()
+                rel_path = f.relative_to(session_dir).as_posix()  # "jpeg/450nm.jpg"
                 header = json.dumps({
                     "cmd":      "file",
-                    "filename": f.name,
+                    "filename": rel_path,   # ← относительный путь
                     "size":     len(data),
                 }).encode("utf-8") + b"\n"
                 conn.sendall(header)
@@ -1032,17 +1032,14 @@ class App:
                     self.cam.stop()
                     self.cam_running = False
 
-                # configure() must be called while camera is stopped
+                # Switch to correct config and apply capture exposure
                 cfg = self._cfg_raw if CAPTURE_FORMAT == "raw" else self._cfg_jpeg
                 self.cam.configure(cfg)
+                self._apply_capture_settings()
 
                 self.cam.start()
                 self.cam_running = True
-
-                # set_controls() must be called AFTER start() to take effect
-                self._apply_capture_settings()
-                # Let the sensor settle with the new exposure
-                time.sleep(0.5)
+                time.sleep(0.3)
 
                 for i, (led, wl, duty) in enumerate(LED_TABLE):
                     self.root.after(0, lambda m=f"Снимок {i+1}/{len(LED_TABLE)}  —  {wl} нм":
@@ -1061,17 +1058,16 @@ class App:
                     jpeg_buf = io.BytesIO()
                     req.save("main", jpeg_buf, format="jpeg")
 
-                    # In RAW mode use save_dng() — correct picamera2 API for DNG
+                    # In RAW mode also grab the DNG from raw stream
                     if CAPTURE_FORMAT == "raw":
-                        import tempfile, os as _os
                         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".dng")
                         try:
-                            _os.close(tmp_fd)
+                            os.close(tmp_fd)
                             req.save_dng(tmp_path)
                             raw_bufs.append((wl, Path(tmp_path).read_bytes()))
                         finally:
                             try:
-                                _os.unlink(tmp_path)
+                                os.unlink(tmp_path)
                             except Exception:
                                 pass
 
@@ -1088,7 +1084,7 @@ class App:
                 self.cam.stop()
                 self.cam_running = False
 
-                # Restore JPEG config so preview works on next session
+                # Restore JPEG config for next preview session
                 self.cam.configure(self._cfg_jpeg)
 
             except Exception as e:
