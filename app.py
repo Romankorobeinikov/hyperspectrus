@@ -303,7 +303,7 @@ class NetworkServer:
             self._sock.bind((SERVER_HOST, SERVER_PORT))
             self._sock.listen(1)
             self._sock.settimeout(1.0)
-            print(f"Network server listening on {SERVER_PORT}")
+            print(f"Network server listening on {SERVER_HOST}:{SERVER_PORT}")
         except Exception as e:
             print(f"Server bind error: {e}")
             return
@@ -735,7 +735,7 @@ class App:
 
         # Network info
         tk.Label(f,
-                 text="Сеть: HyperspectRus  ·  172.20.10.2",
+                 text="Сеть: HyperspectRus",
                  font=("DejaVu Sans", 13),
                  fg=TEXT_DIM, bg=BG,
                  ).place(relx=0.5, rely=0.50, anchor="center")
@@ -1138,7 +1138,7 @@ class App:
                 self.cam.start()
                 self.cam_running = True
                 time.sleep(0.3)
-
+                jpeg_bufs = []
                 for i, (led, wl, duty) in enumerate(LED_TABLE):
                     self.root.after(0, lambda m=f"Снимок {i+1}/{len(LED_TABLE)}  —  {wl} нм":
                                     self.cap_progress.config(text=m))
@@ -1175,16 +1175,18 @@ class App:
                     if self.stm.connected:
                         self.stm.led_off(led)
 
-                    jpeg_buf.seek(0)
-                    img = Image.open(jpeg_buf)
-                    img.load()
-                    images.append((wl, img.copy()))
+                    jpeg_bufs.append((wl, jpeg_buf))
 
                 self.cam.stop()
                 self.cam_running = False
 
                 # Restore JPEG config for next preview session
                 self.cam.configure(self._cfg_jpeg)
+                for wl, buf in jpeg_bufs:
+                    buf.seek(0)
+                    img = Image.open(buf)
+                    img.load()
+                    images.append((wl, img.copy()))
 
             except Exception as e:
                 print(f"Capture error: {e}")
