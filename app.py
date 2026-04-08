@@ -362,7 +362,8 @@ class NetworkServer:
         except Exception as e:
             print(f"Send error: {e}")
 
-    def send_photos(self, session_dir: Path, patient_id: str, notes: str):
+    def send_photos(self, session_dir: Path, patient_id: str, notes: str,
+                    progress_cb=None):
         """Send all photos from session_dir to connected PC using relative paths."""
         conn = self._client
         if not conn:
@@ -375,18 +376,21 @@ class NetworkServer:
             files = sorted(
                 f for f in session_dir.rglob("*") if f.is_file()
             )
+            total = len(files)
             meta = {
                 "cmd":        "session_start",
                 "patient_id": patient_id,
                 "notes":      notes,
-                "file_count": len(files),
+                "file_count": total,
             }
             self._send(conn, meta)
             time.sleep(0.1)
 
-            for f in files:
+            for idx, f in enumerate(files, start=1):
                 data     = f.read_bytes()
-                rel_path = f.relative_to(session_dir).as_posix()  # e.g. "jpeg/1/450nm.jpg"
+                rel_path = f.relative_to(session_dir).as_posix()
+                if progress_cb:
+                    progress_cb(idx, total, rel_path)
                 header   = json.dumps({
                     "cmd":      "file",
                     "filename": rel_path,
@@ -459,6 +463,7 @@ class App:
         self._build_task_select()
         self._build_main()
         self._build_finish_confirm()
+        self._build_sending()
         self._build_capturing()
         self._build_photo_preview()
 
@@ -981,6 +986,13 @@ class App:
         self._stop_cam_preview()
         threading.Thread(target=self.stm.all_off, daemon=True).start()
         if self.session_dir is not None and self.saved_sets:
+            # Count files first so we can show total on the progress screen
+            sd = self.session_dir
+            try:
+                total = sum(1 for f in sd.rglob("*") if f.is_file())
+            except Exception:
+                total = 0
+            self._show_sending(total)
             threading.Thread(target=self._send_all_photos, daemon=True).start()
         else:
             self._reset_session()
@@ -988,7 +1000,12 @@ class App:
 
     def _send_all_photos(self):
         sd = self.session_dir
-        ok = self.net_server.send_photos(sd, self.patient_id, self.notes)
+
+        def _progress(current, total, filename):
+            self.root.after(0, self._update_send_progress, current, total, filename)
+
+        ok = self.net_server.send_photos(sd, self.patient_id, self.notes,
+                                         progress_cb=_progress)
         if ok:
             # Delete session folder from Pi to free memory
             try:
@@ -1003,6 +1020,66 @@ class App:
     def _reset_session(self):
         self.saved_sets  = []
         self.session_dir = None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SENDING PROGRESS SCREEN
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_sending(self):
+        f = tk.Frame(self.root, bg=BG)
+        self.frames["sending"] = f
+
+        tk.Label(f, text="Отправка на ПК…",
+                 font=("DejaVu Sans", 40, "bold"),
+                 fg=ACCENT_GRN, bg=BG,
+                 ).place(relx=0.5, rely=0.22, anchor="center")
+
+        # File count label  e.g.  "Файл 3 из 16"
+        self.send_count_lbl = tk.Label(f, text="",
+                                       font=("DejaVu Sans", 22),
+                                       fg=TEXT_WHITE, bg=BG)
+        self.send_count_lbl.place(relx=0.5, rely=0.42, anchor="center")
+
+        # Current filename
+        self.send_file_lbl = tk.Label(f, text="",
+                                      font=("DejaVu Sans", 14),
+                                      fg=TEXT_DIM, bg=BG)
+        self.send_file_lbl.place(relx=0.5, rely=0.53, anchor="center")
+
+        # Progress bar track
+        BAR_W, BAR_H = 640, 28
+        self._send_bar_w = BAR_W
+        track = tk.Canvas(f, width=BAR_W, height=BAR_H,
+                          bg="#1E1E1E", highlightthickness=0, bd=0)
+        track.place(relx=0.5, rely=0.65, anchor="center")
+        self._send_bar_canvas = track
+        self._send_bar_rect   = track.create_rectangle(
+            0, 0, 0, BAR_H, fill=BTN_ACTIVE, outline="")
+
+        # Percent label
+        self.send_pct_lbl = tk.Label(f, text="0%",
+                                     font=("DejaVu Sans", 18, "bold"),
+                                     fg=ACCENT_GRN, bg=BG)
+        self.send_pct_lbl.place(relx=0.5, rely=0.77, anchor="center")
+
+    def _show_sending(self, total_files: int):
+        self.send_count_lbl.config(text=f"0 из {total_files} файлов")
+        self.send_file_lbl.config(text="")
+        self.send_pct_lbl.config(text="0%")
+        self._send_bar_canvas.coords(self._send_bar_rect, 0, 0, 0, 28)
+        self._show("sending")
+
+    def _update_send_progress(self, current: int, total: int, filename: str):
+        """Called from background thread via root.after."""
+        if total == 0:
+            pct = 0
+        else:
+            pct = int(current / total * 100)
+        bar_px = int(self._send_bar_w * pct / 100)
+        self.send_count_lbl.config(text=f"{current} из {total} файлов")
+        self.send_file_lbl.config(text=filename)
+        self.send_pct_lbl.config(text=f"{pct}%")
+        self._send_bar_canvas.coords(self._send_bar_rect, 0, 0, bar_px, 28)
 
     # ─────────────────────────────────────────────────────────────────────────
     # CAPTURE SCREEN
