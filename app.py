@@ -10,7 +10,6 @@ import threading
 import time
 import io
 import os
-import base64
 import tempfile
 import sys
 import json
@@ -506,14 +505,14 @@ class App:
 
             # Preview config: exact display size so no crop is needed
             self._cfg_jpeg = self.cam.create_video_configuration(
-                main={"size": (PREVIEW_W, H), "format": "RGB888"},
+                main={"size": (PREVIEW_W, H-STATUS_H), "format": "RGB888"},
                 buffer_count=8,
             )
 
             # Capture config: full-res main + raw sensor stream
             self._cfg_raw = self.cam.create_video_configuration(
                 main={"size": (1280, 720), "format": "RGB888"},
-                raw={},          # picamera2 picks sensor native format
+                raw={"size": (4608, 2592)},          # picamera2 picks sensor native format
                 buffer_count=8,
             )
 
@@ -528,7 +527,7 @@ class App:
                 "LensPosition": 12.0,
                 'FrameRate': 50,
             })
-            print(f"Camera initialized (1280x720, format={CAPTURE_FORMAT})")
+            print(f"Camera initialized")
         except Exception as e:
             print(f"Camera init error: {e}")
             self.cam = None
@@ -567,12 +566,8 @@ class App:
         if self.screen != "main" or not self.cam_running:
             return
         try:
-            arr = self.cam.capture_array()          # numpy RGB888 (H, W, 3)
-            h, w = arr.shape[:2]
-            # Build raw PPM in memory — tkinter PhotoImage understands it natively
-            header = f"P6\n{w} {h}\n255\n".encode()
-            ppm_b64 = base64.b64encode(header + arr.tobytes()).decode()
-            ph = tk.PhotoImage(data=ppm_b64)
+            arr = self.cam.capture_array()
+            ph  = ImageTk.PhotoImage(Image.fromarray(arr))
             self.main_prev_lbl.config(image=ph, text="")
             self.main_prev_lbl.image = ph
             self._photo_cache["preview"] = ph
