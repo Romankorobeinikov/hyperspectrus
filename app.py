@@ -512,7 +512,7 @@ class App:
             # Capture config: full-res main + raw sensor stream
             self._cfg_raw = self.cam.create_video_configuration(
                 main={"size": (1280, 720), "format": "RGB888"},
-                raw={"size": (4608, 2592)},          # picamera2 picks sensor native format
+                raw={"size": (2304, 1296)},          # picamera2 picks sensor native format
                 buffer_count=8,
             )
 
