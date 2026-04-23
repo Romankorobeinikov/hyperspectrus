@@ -19,6 +19,10 @@ import struct
 import datetime
 from pathlib import Path
 
+if os.environ.get('DISPLAY','') == '':
+    print('no display found. Using :0.0')
+    os.environ.__setitem__('DISPLAY', ':0.0')
+
 # ── PIL ──────────────────────────────────────────────────────────────────────
 try:
     from PIL import Image, ImageTk, ImageDraw
@@ -751,7 +755,7 @@ class App:
 
         # Network info
         tk.Label(f,
-                 text=f"Сеть: HyperspectRus  IP: {self._get_local_ip()}",
+                 text=f"Сеть: HyperspectRus  IP: {get_local_ip()}",
                  font=("DejaVu Sans", 13),
                  fg=TEXT_DIM, bg=BG,
                  ).place(relx=0.5, rely=0.50, anchor="center")
