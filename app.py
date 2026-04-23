@@ -1162,14 +1162,17 @@ class App:
                 # ── PHASE 1: fast shooting — only grab buffers, release ASAP ──
                 shot_data = []   # (wl, main_arr, raw_arr_or_None, metadata)
                 for i, (led, wl, duty) in enumerate(LED_TABLE):
+
+                    if self.stm.connected:
+                        self.stm.led_on(led)
+                        time.sleep(0.05)
+                        
                     self.root.after(0, lambda m=f"Снимок {i+1}/{len(LED_TABLE)}  —  {wl} нм":
                                     self.cap_progress.config(text=m))
                     self.root.after(0, lambda m=f"LED {led}  ·  {duty}% PWM":
                                     self.cap_led_lbl.config(text=m))
 
-                    if self.stm.connected:
-                        self.stm.led_on(led)
-                        time.sleep(0.05)
+                    
 
                     req      = self.cam.capture_request()
                     main_arr = req.make_array("main").copy()
@@ -1179,6 +1182,7 @@ class App:
 
                     if self.stm.connected:
                         self.stm.led_off(led)
+                        time.sleep(0.05)
 
                     shot_data.append((wl, main_arr, raw_arr, metadata))
 
