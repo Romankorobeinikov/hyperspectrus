@@ -10,6 +10,7 @@ import threading
 import time
 import io
 import os
+import base64
 import tempfile
 import sys
 import json
@@ -241,6 +242,16 @@ class STM32:
 # ═══════════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def get_local_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "—"
 
 def mv_to_pct(mv: int) -> int:
     if mv <= 0:
@@ -489,15 +500,17 @@ class App:
         try:
             self.cam = Picamera2()
 
-            # JPEG-only config (used for preview and jpeg capture)
-            self._cfg_jpeg = self.cam.create_still_configuration(
-                main={"size": (1280, 720), "format": "RGB888"},
+            # Preview config: exact display size so no crop is needed
+            self._cfg_jpeg = self.cam.create_video_configuration(
+                main={"size": (PREVIEW_W, H), "format": "RGB888"},
+                buffer_count=8,
             )
 
-            # RAW config: main stream for jpeg preview + raw stream for DNG
-            self._cfg_raw = self.cam.create_still_configuration(
+            # Capture config: full-res main + raw sensor stream
+            self._cfg_raw = self.cam.create_video_configuration(
                 main={"size": (1280, 720), "format": "RGB888"},
-                raw={},   # picamera2 picks sensor native format automatically
+                raw={},          # picamera2 picks sensor native format
+                buffer_count=8,
             )
 
             # Start with JPEG config
@@ -509,6 +522,7 @@ class App:
                 "ColourGains": (1.0, 1.0),
                 "AfMode":      libcontrols.AfModeEnum.Manual,
                 "LensPosition": 12.0,
+                'FrameRate': 50,
             })
             print(f"Camera initialized (1280x720, format={CAPTURE_FORMAT})")
         except Exception as e:
@@ -549,10 +563,12 @@ class App:
         if self.screen != "main" or not self.cam_running:
             return
         try:
-            arr = self.cam.capture_array()
-            img = Image.fromarray(arr)
-            cropped = resize_to_fill(img, PREVIEW_W, H - STATUS_H)
-            ph = ImageTk.PhotoImage(cropped)
+            arr = self.cam.capture_array()          # numpy RGB888 (H, W, 3)
+            h, w = arr.shape[:2]
+            # Build raw PPM in memory — tkinter PhotoImage understands it natively
+            header = f"P6\n{w} {h}\n255\n".encode()
+            ppm_b64 = base64.b64encode(header + arr.tobytes()).decode()
+            ph = tk.PhotoImage(data=ppm_b64)
             self.main_prev_lbl.config(image=ph, text="")
             self.main_prev_lbl.image = ph
             self._photo_cache["preview"] = ph
@@ -735,7 +751,7 @@ class App:
 
         # Network info
         tk.Label(f,
-                 text="Сеть: HyperspectRus",
+                 text=f"Сеть: HyperspectRus  IP: {self._get_local_ip()}",
                  font=("DejaVu Sans", 13),
                  fg=TEXT_DIM, bg=BG,
                  ).place(relx=0.5, rely=0.50, anchor="center")
@@ -1121,8 +1137,8 @@ class App:
         threading.Thread(target=self._capture_sequence, daemon=True).start()
 
     def _capture_sequence(self):
-        images   = []   # list of (wl, PIL.Image) — always for preview
-        raw_bufs = []   # list of (wl, bytes) — DNG data, only in raw mode
+        images   = []   # list of (wl, PIL.Image) — for preview after capture
+        raw_bufs = []   # list of (wl, bytes)     — DNG data, only in raw mode
 
         if CAM_OK and self.cam:
             try:
@@ -1130,15 +1146,17 @@ class App:
                     self.cam.stop()
                     self.cam_running = False
 
-                # Switch to correct config and apply capture exposure
-                cfg = self._cfg_raw if CAPTURE_FORMAT == "raw" else self._cfg_jpeg
-                self.cam.configure(cfg)
+                # Choose config and apply capture exposure
+                cap_cfg = self._cfg_raw if CAPTURE_FORMAT == "raw" else self._cfg_jpeg
+                self.cam.configure(cap_cfg)
                 self._apply_capture_settings()
 
                 self.cam.start()
                 self.cam_running = True
-                time.sleep(0.3)
-                jpeg_bufs = []
+                time.sleep(0.1)
+
+                # ── PHASE 1: fast shooting — only grab buffers, release ASAP ──
+                shot_data = []   # (wl, main_arr, raw_arr_or_None, metadata)
                 for i, (led, wl, duty) in enumerate(LED_TABLE):
                     self.root.after(0, lambda m=f"Снимок {i+1}/{len(LED_TABLE)}  —  {wl} нм":
                                     self.cap_progress.config(text=m))
@@ -1150,43 +1168,43 @@ class App:
                         self.stm.led_on(led)
                         time.sleep(0.05)
 
-                    req = self.cam.capture_request()
-
-                    # Always grab JPEG from main stream for preview
-                    jpeg_buf = io.BytesIO()
-                    req.save("main", jpeg_buf, format="jpeg")
-
-                    # In RAW mode also grab the DNG from raw stream
-                    if CAPTURE_FORMAT == "raw":
-                        import tempfile, os as _os
-                        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".dng")
-                        try:
-                            _os.close(tmp_fd)
-                            req.save_dng(tmp_path)
-                            raw_bufs.append((wl, Path(tmp_path).read_bytes()))
-                        finally:
-                            try:
-                                _os.unlink(tmp_path)
-                            except Exception:
-                                pass
-
-                    req.release()
+                    req      = self.cam.capture_request()
+                    main_arr = req.make_array("main").copy()
+                    raw_arr  = req.make_array("raw").copy() if CAPTURE_FORMAT == "raw" else None
+                    metadata = req.get_metadata()
+                    req.release()                            # ← release immediately
 
                     if self.stm.connected:
                         self.stm.led_off(led)
 
-                    jpeg_bufs.append((wl, jpeg_buf))
+                    shot_data.append((wl, main_arr, raw_arr, metadata))
 
                 self.cam.stop()
                 self.cam_running = False
 
-                # Restore JPEG config for next preview session
+                # Restore preview config for next session
                 self.cam.configure(self._cfg_jpeg)
-                for wl, buf in jpeg_bufs:
-                    buf.seek(0)
-                    img = Image.open(buf)
-                    img.load()
-                    images.append((wl, img.copy()))
+
+                # ── PHASE 2: post-capture encoding (off the hot path) ──────────
+                for wl, main_arr, raw_arr, meta in shot_data:
+                    # JPEG via helpers (PIL only here, not in realtime)
+                    pil_img = self.cam.helpers.make_image(main_arr, cap_cfg["main"])
+                    images.append((wl, pil_img))
+
+                    # DNG via helpers
+                    if CAPTURE_FORMAT == "raw" and raw_arr is not None:
+                        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".dng")
+                        try:
+                            os.close(tmp_fd)
+                            self.cam.helpers.save_dng(
+                                raw_arr, meta, cap_cfg["raw"], tmp_path
+                            )
+                            raw_bufs.append((wl, Path(tmp_path).read_bytes()))
+                        finally:
+                            try:
+                                os.unlink(tmp_path)
+                            except Exception:
+                                pass
 
             except Exception as e:
                 print(f"Capture error: {e}")
