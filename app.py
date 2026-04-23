@@ -512,7 +512,7 @@ class App:
             # Capture config: full-res main + raw sensor stream
             self._cfg_raw = self.cam.create_video_configuration(
                 main={"size": (1280, 720), "format": "RGB888"},
-                raw={"size": (2304, 1296)},          # picamera2 picks sensor native format
+                raw={},          # picamera2 picks sensor native format
                 buffer_count=8,
             )
 
@@ -1141,6 +1141,11 @@ class App:
 
         if CAM_OK and self.cam:
             try:
+                for i, (led, wl, duty) in enumerate(LED_TABLE):
+                    if self.stm.connected:
+                        self.stm.led_duty(led, duty)
+                        time.sleep(0.02)
+
                 if self.cam_running:
                     self.cam.stop()
                     self.cam_running = False
@@ -1163,7 +1168,6 @@ class App:
                                     self.cap_led_lbl.config(text=m))
 
                     if self.stm.connected:
-                        self.stm.led_duty(led, duty)
                         self.stm.led_on(led)
                         time.sleep(0.05)
 
@@ -1180,6 +1184,9 @@ class App:
 
                 self.cam.stop()
                 self.cam_running = False
+
+                self.root.after(0, lambda: self.cap_progress.config(text="Обработка…"))
+                self.root.after(0, lambda: self.cap_led_lbl.config(text=""))
 
                 # Restore preview config for next session
                 self.cam.configure(self._cfg_jpeg)
