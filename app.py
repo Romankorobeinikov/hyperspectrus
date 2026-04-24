@@ -1159,8 +1159,9 @@ class App:
                     self.root.after(0, lambda m=f"LED {led}  ·  {duty}% PWM":
                                     self.cap_led_lbl.config(text=m))
 
-                    # throwaway = self.cam.capture_request()
-                    # throwaway.release()
+                    for _ in range(2):
+                        throwaway = self.cam.capture_request()
+                        throwaway.release()
 
                     req      = self.cam.capture_request()
                     main_arr = req.make_array("main").copy()
