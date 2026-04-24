@@ -124,7 +124,7 @@ WARN_COL   = "#FF6600"
 class STM32:
     PORTS   = ["/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyUSB0", "/dev/ttyUSB1"]
     BAUD    = 9600
-    TIMEOUT = 0.5
+    TIMEOUT = 0.1
 
     def __init__(self):
         self.ser       = None
@@ -168,16 +168,8 @@ class STM32:
                 self.ser.reset_input_buffer()
                 self.ser.write(cmd.encode("utf-8"))
                 self.ser.flush()
-                deadline = time.time() + self.TIMEOUT
                 buf = b""
-                while time.time() < deadline:
-                    chunk = self.ser.read(self.ser.in_waiting or 1)
-                    if chunk:
-                        buf += chunk
-                        if b"\n" in buf:
-                            break
-                    else:
-                        time.sleep(0.005)
+                buf = self.ser.read_until(b"\n", size=256)
                 return buf.decode("utf-8", errors="ignore").strip()
             except serial.SerialException as e:
                 print(f"STM32 serial error: {e}")
@@ -1144,7 +1136,6 @@ class App:
                 for i, (led, wl, duty) in enumerate(LED_TABLE):
                     if self.stm.connected:
                         self.stm.led_duty(led, duty)
-                        time.sleep(0.02)
 
                 if self.cam_running:
                     self.cam.stop()
@@ -1165,7 +1156,6 @@ class App:
 
                     if self.stm.connected:
                         self.stm.led_on(led)
-                        time.sleep(0.05)
                         
                     self.root.after(0, lambda m=f"Снимок {i+1}/{len(LED_TABLE)}  —  {wl} нм":
                                     self.cap_progress.config(text=m))
@@ -1182,7 +1172,6 @@ class App:
 
                     if self.stm.connected:
                         self.stm.led_off(led)
-                        time.sleep(0.05)
 
                     shot_data.append((wl, main_arr, raw_arr, metadata))
 
