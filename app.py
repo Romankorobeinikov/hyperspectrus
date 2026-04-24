@@ -498,14 +498,12 @@ class App:
             # Preview config: exact display size so no crop is needed
             self._cfg_jpeg = self.cam.create_video_configuration(
                 main={"size": (PREVIEW_W, H-STATUS_H), "format": "RGB888"},
-                buffer_count=8,
             )
 
             # Capture config: full-res main + raw sensor stream
             self._cfg_raw = self.cam.create_video_configuration(
                 main={"size": (1280, 720), "format": "RGB888"},
                 raw={},          # picamera2 picks sensor native format
-                buffer_count=8,
             )
 
             # Start with JPEG config
@@ -517,7 +515,6 @@ class App:
                 "ColourGains": (1.0, 1.0),
                 "AfMode":      libcontrols.AfModeEnum.Manual,
                 "LensPosition": 12.0,
-                'FrameRate': 50,
             })
             print(f"Camera initialized")
         except Exception as e:
@@ -1162,7 +1159,8 @@ class App:
                     self.root.after(0, lambda m=f"LED {led}  ·  {duty}% PWM":
                                     self.cap_led_lbl.config(text=m))
 
-                    
+                    # throwaway = self.cam.capture_request()
+                    # throwaway.release()
 
                     req      = self.cam.capture_request()
                     main_arr = req.make_array("main").copy()
