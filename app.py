@@ -4,6 +4,11 @@ HyperspectRus — Hyperspectral Camera App
 Raspberry Pi Zero + Picamera2 + STM32 + 800x480 touchscreen
 """
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOGGING FLAG  ←  установите False чтобы полностью отключить запись логов
+# ═══════════════════════════════════════════════════════════════════════════════
+ENABLE_LOGGING = True
+
 import tkinter as tk
 from tkinter import font as tkfont
 import threading
@@ -65,6 +70,7 @@ except ImportError:
 
 W, H         = 800, 480
 ASSETS       = Path("assets")
+LOG_DIR      = Path("logs")           # папка рядом со скриптом
 PREVIEW_W    = 490
 PANEL_X      = PREVIEW_W + 6
 PANEL_W      = W - PREVIEW_W - 10
@@ -115,6 +121,140 @@ TEXT_WHITE = "#FFFFFF"
 TEXT_DIM   = "#888888"
 ACCENT_GRN = "#6FCF3A"
 WARN_COL   = "#FF6600"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOGGER
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Формат строки:
+#   2024-01-15 14:23:05.123 | STARTUP       | 3842 mV  91% | App started
+#
+# Файл: logs/hyperspectrus_YYYY-MM.log  (новый файл каждый месяц)
+# Запись: append + flush + fsync после каждой строки — безопасно при жёстком
+#         отключении питания. fsync даёт ~5-10 мс задержки, но вызывается
+#         только на событиях (не в цикле), поэтому на UI не влияет.
+#
+# Оценка объёма за месяц (30 дней):
+#   Типичная рабочая смена — 20 сессий по 8 снимков каждая:
+#     • STARTUP       — 1 строка/запуск,  ~2 запуска/день   =   60 строк
+#     • TASK_RECV     — 1 строка/сессия,  20 сессий/день    =  600 строк
+#     • LED_ON/OFF    — 2 строки × 8 LED × 20 сессий        = 3200 строк
+#     • PHOTO         — 8 строк/сессия,   20 сессий          = 4800 строк  (8×20×30=4800/мес)
+#     • FILE_SAVED    — 16 стр/сессия     20 сессий          = 9600 строк
+#     • SEND_START/OK — 2 строки/сессия                     =  600 строк
+#     • CHARGE_*      — ~4 события/день                      =  120 строк
+#     • PC_CONN/DISC  — ~4 события/день                      =  120 строк
+#   Итого ≈ 19 100 строк/месяц × ~95 байт = ~1.8 МБ/месяц
+#   При пиковой нагрузке (40 сессий/день) ≈ 3.5 МБ/месяц
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class Logger:
+    """Потокобезопасный логгер с посекундными метками и немедленным fsync."""
+
+    # Ширина колонки EVENT для выравнивания
+    _EV_WIDTH = 13
+
+    # Уровни / типы событий
+    STARTUP      = "STARTUP"
+    SHUTDOWN     = "SHUTDOWN"
+    TASK_RECV    = "TASK_RECV"
+    LED_ON       = "LED_ON"
+    LED_OFF      = "LED_OFF"
+    PHOTO        = "PHOTO"
+    FILE_SAVED   = "FILE_SAVED"
+    SEND_START   = "SEND_START"
+    SEND_FILE    = "SEND_FILE"
+    SEND_OK      = "SEND_OK"
+    SEND_FAIL    = "SEND_FAIL"
+    CHARGE_ON    = "CHARGE_ON"
+    CHARGE_OFF   = "CHARGE_OFF"
+    PC_CONN      = "PC_CONN"
+    PC_DISC      = "PC_DISC"
+    ERROR        = "ERROR"
+
+    def __init__(self, log_dir: Path):
+        self._dir   = log_dir
+        self._lock  = threading.Lock()
+        self._fh    = None          # текущий файловый дескриптор
+        self._month = None          # "YYYY-MM" открытого файла
+        if ENABLE_LOGGING:
+            try:
+                self._dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                print(f"Logger: cannot create log dir: {e}")
+
+    # ── public API ───────────────────────────────────────────────────────────
+
+    def log(self, event: str, detail: str = "", voltage_mv: int = -1):
+        """Записать одну строку в лог.
+
+        Args:
+            event:      тип события (константа класса)
+            detail:     произвольное описание
+            voltage_mv: напряжение батареи в мВ (-1 = неизвестно)
+        """
+        if not ENABLE_LOGGING:
+            return
+        ts      = datetime.datetime.now()
+        ts_str  = ts.strftime("%Y-%m-%d %H:%M:%S.") + f"{ts.microsecond // 1000:03d}"
+        bat_str = self._fmt_bat(voltage_mv)
+        ev_str  = event.ljust(self._EV_WIDTH)
+        line    = f"{ts_str} | {ev_str} | {bat_str} | {detail}\n"
+        with self._lock:
+            try:
+                fh = self._get_fh(ts)
+                fh.write(line)
+                fh.flush()
+                os.fsync(fh.fileno())   # гарантия записи на SD даже при жёстком отключении
+            except Exception as e:
+                print(f"Logger write error: {e}")
+                self._fh = None         # попробуем переоткрыть при следующем вызове
+
+    def close(self):
+        with self._lock:
+            if self._fh:
+                try:
+                    self._fh.close()
+                except Exception:
+                    pass
+                self._fh = None
+
+    # ── private ──────────────────────────────────────────────────────────────
+
+    def _get_fh(self, ts: datetime.datetime):
+        """Вернуть (или открыть/ротировать) файловый дескриптор."""
+        month = ts.strftime("%Y-%m")
+        if self._fh is None or month != self._month:
+            if self._fh:
+                try:
+                    self._fh.close()
+                except Exception:
+                    pass
+            path = self._dir / f"hyperspectrus_{month}.log"
+            self._fh    = open(path, "a", encoding="utf-8", buffering=1)
+            self._month = month
+            # Записываем разделитель при открытии нового/существующего файла
+            sep = "-" * 80 + "\n"
+            self._fh.write(sep)
+            self._fh.flush()
+        return self._fh
+
+    @staticmethod
+    def _fmt_bat(mv: int) -> str:
+        if mv <= 0:
+            return "  ??? mV  ??%"
+        pct = max(0, min(100, int((mv - 3200) / (4200 - 3200) * 100)))
+        return f"{mv:5d} mV {pct:3d}%"
+
+
+# Глобальный экземпляр; инициализируется в App.__init__
+_logger: "Logger | None" = None
+
+def log(event: str, detail: str = "", voltage_mv: int = -1):
+    """Удобная глобальная функция-обёртка."""
+    if _logger:
+        _logger.log(event, detail, voltage_mv)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -296,10 +436,14 @@ class NetworkServer:
     """Listens for PC connections; receives tasks, sends back photos."""
 
     def __init__(self, app):
-        self.app      = app
-        self._running = True
-        self._sock    = None
-        self._client  = None
+        self.app             = app
+        self._running        = True
+        self._sock           = None
+        self._client         = None
+        self._ack_event      = threading.Event()   # сигнал об ACK от PC
+        self._last_ack_file  = None                # имя файла из последнего ACK
+        # Незавершённая сессия для повтора при переподключении
+        self._pending_session = None  # (session_dir, patient_id, notes, sent_files)
         threading.Thread(target=self._serve, daemon=True).start()
 
     def _serve(self):
@@ -317,9 +461,22 @@ class NetworkServer:
         while self._running:
             try:
                 conn, addr = self._sock.accept()
+                # ── keepalive на принятом сокете ──────────────────────────────
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                try:
+                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE,  20)
+                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL,  5)
+                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT,    4)
+                except AttributeError:
+                    pass  # Linux-specific constants, на других платформах не ломаем
                 self._client = conn
                 print(f"PC connected from {addr}")
                 self.app.root.after(0, lambda: self.app.set_pc_connected(True))
+                # Если есть незавершённая сессия — предложить отправить её повторно
+                if self._pending_session:
+                    self.app.root.after(
+                        0, lambda: self.app._offer_retry_pending_session()
+                    )
                 self._handle(conn)
                 self.app.root.after(0, lambda: self.app.set_pc_connected(False))
                 self._client = None
@@ -360,6 +517,10 @@ class NetworkServer:
             self.app.root.after(0, lambda: self.app.receive_task(patient_id, notes))
         elif cmd == "ping":
             self._send(conn, {"cmd": "pong"})
+        elif cmd == "ack":
+            # PC подтвердил приём файла
+            self._last_ack_file = msg.get("filename")
+            self._ack_event.set()
 
     def _send(self, conn, data: dict):
         try:
@@ -368,48 +529,97 @@ class NetworkServer:
         except Exception as e:
             print(f"Send error: {e}")
 
+    def _wait_ack(self, expected_filename: str, timeout: float = 30.0) -> bool:
+        """Ждём ACK от PC на конкретный файл. Возвращает True если получен."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self._ack_event.clear()
+            if self._last_ack_file == expected_filename:
+                return True
+            remaining = deadline - time.monotonic()
+            self._ack_event.wait(timeout=min(remaining, 1.0))
+            if self._last_ack_file == expected_filename:
+                return True
+        print(f"ACK timeout for {expected_filename}")
+        return False
+
     def send_photos(self, session_dir: Path, patient_id: str, notes: str,
-                    progress_cb=None):
-        """Send all photos from session_dir to connected PC using relative paths."""
+                    progress_cb=None, skip_files: set = None):
+        """Send all photos from session_dir to connected PC using relative paths.
+
+        skip_files — набор rel_path строк уже отправленных файлов (для повтора).
+        """
         conn = self._client
         if not conn:
             print("No PC connected — cannot send photos")
             return False
+
+        skip_files = skip_files or set()
+
         try:
-            # Wait a moment for any background _save threads to finish writing
+            # Ждём завершения фоновых потоков записи
             time.sleep(0.5)
 
-            files = sorted(
-                f for f in session_dir.rglob("*") if f.is_file()
-            )
+            all_files = sorted(f for f in session_dir.rglob("*") if f.is_file())
+            # Фильтруем уже подтверждённые файлы при повторной отправке
+            files = [f for f in all_files
+                     if f.relative_to(session_dir).as_posix() not in skip_files]
             total = len(files)
+
             meta = {
                 "cmd":        "session_start",
                 "patient_id": patient_id,
                 "notes":      notes,
                 "file_count": total,
+                "resume":     len(skip_files) > 0,
             }
             self._send(conn, meta)
             time.sleep(0.1)
+
+            sent_files = set(skip_files)
 
             for idx, f in enumerate(files, start=1):
                 data     = f.read_bytes()
                 rel_path = f.relative_to(session_dir).as_posix()
                 if progress_cb:
                     progress_cb(idx, total, rel_path)
-                header   = json.dumps({
+
+                import hashlib
+                checksum = hashlib.md5(data).hexdigest()
+
+                header = json.dumps({
                     "cmd":      "file",
                     "filename": rel_path,
                     "size":     len(data),
+                    "md5":      checksum,
                 }).encode("utf-8") + b"\n"
+
+                self._last_ack_file = None   # сброс перед отправкой
                 conn.sendall(header)
                 conn.sendall(data)
-                time.sleep(0.02)
+
+                # Ждём ACK — без него не отправляем следующий файл
+                if not self._wait_ack(rel_path, timeout=60.0):
+                    # Таймаут ACK — сохраняем состояние для повтора
+                    self._pending_session = (
+                        session_dir, patient_id, notes, sent_files
+                    )
+                    print(f"Transfer interrupted after {len(sent_files)} files")
+                    return False
+
+                sent_files.add(rel_path)
 
             self._send(conn, {"cmd": "session_end"})
+            self._pending_session = None   # сессия завершена успешно
             return True
+
         except Exception as e:
             print(f"Photo send error: {e}")
+            # Сохраняем незавершённую сессию для повтора
+            self._pending_session = (
+                session_dir, patient_id, notes,
+                sent_files if 'sent_files' in dir() else set()
+            )
             return False
 
 
@@ -435,6 +645,10 @@ class App:
         self.saved_sets   = []       # list of session dirs to send
         self.pc_connected = False
         self._preview_job = None
+
+        # ── Logger ────────────────────────────────────────────────────────────
+        global _logger
+        _logger = Logger(LOG_DIR)
 
         # ── Hardware ──────────────────────────────────────────────────────────
         self.stm    = STM32()
@@ -482,6 +696,10 @@ class App:
         self.net_server = NetworkServer(self)
 
         # ── Boot ──────────────────────────────────────────────────────────────
+        log(Logger.STARTUP,
+            f"App started | format={CAPTURE_FORMAT} | cam={'OK' if CAM_OK else 'NO'}"
+            f" | stm={'OK' if self.stm_ok else 'NO'}",
+            voltage_mv=self.stm.get_battery_mv() if self.stm_ok else -1)
         self.root.after(100, self._boot)
         self.root.mainloop()
 
@@ -598,11 +816,17 @@ class App:
 
     def _on_charge_changed(self):
         if self.charging in (1, 2):
+            log(Logger.CHARGE_ON,
+                f"charging state={self.charging}",
+                voltage_mv=self.stm.get_battery_mv() if self.stm_ok else -1)
             if self.screen != "splash":
                 self._stop_cam_preview()
                 threading.Thread(target=self.stm.all_off, daemon=True).start()
                 self._show_splash()
         else:
+            log(Logger.CHARGE_OFF,
+                f"charging state={self.charging}",
+                voltage_mv=self.stm.get_battery_mv() if self.stm_ok else -1)
             if self.screen == "splash":
                 self._show_waiting()
 
@@ -651,14 +875,38 @@ class App:
 
     def set_pc_connected(self, connected: bool):
         self.pc_connected = connected
+        if connected:
+            log(Logger.PC_CONN, "PC connected",
+                voltage_mv=self.stm.get_battery_mv() if self.stm_ok else -1)
+        else:
+            log(Logger.PC_DISC, "PC disconnected",
+                voltage_mv=self.stm.get_battery_mv() if self.stm_ok else -1)
         if self.screen == "waiting":
             self._update_wait_pc_label()
+
+    def _offer_retry_pending_session(self):
+        """Вызывается когда PC переподключился и есть незавершённая сессия."""
+        ps = self.net_server._pending_session
+        if not ps:
+            return
+        session_dir, patient_id, notes, sent_files = ps
+        print(f"Retrying pending session: {session_dir}, "
+              f"already sent: {len(sent_files)} files")
+        def _do_retry():
+            self.net_server.send_photos(
+                session_dir, patient_id, notes,
+                skip_files=sent_files
+            )
+        threading.Thread(target=_do_retry, daemon=True).start()
 
     def receive_task(self, patient_id: str, notes: str):
         self.patient_id  = patient_id
         self.notes       = notes
         self.saved_sets  = []
         self.session_dir = None
+        log(Logger.TASK_RECV,
+            f"patient_id='{patient_id}' notes='{notes[:60]}'",
+            voltage_mv=self.stm.get_battery_mv() if self.stm_ok else -1)
         # Update labels
         txt = f'ID пациента: "{patient_id}"'
         for attr in ("task_title", "finish_title"):
@@ -1004,13 +1252,28 @@ class App:
 
     def _send_all_photos(self):
         sd = self.session_dir
+        mv = self.stm.get_battery_mv() if self.stm_ok else -1
+        try:
+            total_files = sum(1 for f in sd.rglob("*") if f.is_file())
+        except Exception:
+            total_files = 0
+        log(Logger.SEND_START,
+            f"patient='{self.patient_id}' files={total_files} dir={sd}",
+            voltage_mv=mv)
 
         def _progress(current, total, filename):
             self.root.after(0, self._update_send_progress, current, total, filename)
+            log(Logger.SEND_FILE,
+                f"{current}/{total} {filename}",
+                voltage_mv=self.stm.get_battery_mv() if self.stm_ok else -1)
 
         ok = self.net_server.send_photos(sd, self.patient_id, self.notes,
                                          progress_cb=_progress)
+        mv_after = self.stm.get_battery_mv() if self.stm_ok else -1
         if ok:
+            log(Logger.SEND_OK,
+                f"patient='{self.patient_id}' files={total_files} all ACKed",
+                voltage_mv=mv_after)
             # Delete session folder from Pi to free memory
             try:
                 import shutil
@@ -1018,6 +1281,10 @@ class App:
                 print(f"Deleted local session: {sd}")
             except Exception as e:
                 print(f"Cleanup error: {e}")
+        else:
+            log(Logger.SEND_FAIL,
+                f"patient='{self.patient_id}' transfer interrupted",
+                voltage_mv=mv_after)
         self._reset_session()
         self.root.after(0, self._show_waiting)
 
@@ -1122,6 +1389,9 @@ class App:
         self._show("capturing")
         self.cap_progress.config(text="Подготовка…")
         self.cap_led_lbl.config(text="")
+        log(Logger.PHOTO,
+            f"Capture started | patient='{self.patient_id}' | leds={len(LED_TABLE)}",
+            voltage_mv=self.stm.get_battery_mv() if self.stm_ok else -1)
         threading.Thread(target=self._capture_sequence, daemon=True).start()
 
     def _capture_sequence(self):
@@ -1150,10 +1420,14 @@ class App:
                 # ── PHASE 1: fast shooting — only grab buffers, release ASAP ──
                 shot_data = []   # (wl, main_arr, raw_arr_or_None, metadata)
                 for i, (led, wl, duty) in enumerate(LED_TABLE):
+                    mv_now = self.stm.get_battery_mv() if self.stm_ok else -1
 
                     if self.stm.connected:
                         self.stm.led_on(led)
-                        
+                    log(Logger.LED_ON,
+                        f"led={led} wl={wl}nm duty={duty}%",
+                        voltage_mv=mv_now)
+
                     self.root.after(0, lambda m=f"Снимок {i+1}/{len(LED_TABLE)}  —  {wl} нм":
                                     self.cap_progress.config(text=m))
                     self.root.after(0, lambda m=f"LED {led}  ·  {duty}% PWM":
@@ -1171,6 +1445,12 @@ class App:
 
                     if self.stm.connected:
                         self.stm.led_off(led)
+                    log(Logger.LED_OFF,
+                        f"led={led} wl={wl}nm | shot captured",
+                        voltage_mv=mv_now)
+                    log(Logger.PHOTO,
+                        f"Shot {i+1}/{len(LED_TABLE)} | wl={wl}nm | exposure={CAPTURE_EXPOSURE_US}µs",
+                        voltage_mv=mv_now)
 
                     shot_data.append((wl, main_arr, raw_arr, metadata))
 
@@ -1206,6 +1486,9 @@ class App:
 
             except Exception as e:
                 print(f"Capture error: {e}")
+                log(Logger.ERROR,
+                    f"Capture error: {e}",
+                    voltage_mv=self.stm.get_battery_mv() if self.stm_ok else -1)
                 images   = self._dummy_images()
                 raw_bufs = []
         else:
@@ -1342,6 +1625,9 @@ class App:
             jpeg_set_dir.mkdir(parents=True, exist_ok=True)
             for wl, img in captures_copy:
                 img.save(jpeg_set_dir / f"{wl}nm.jpg", format="JPEG", quality=95)
+                log(Logger.FILE_SAVED,
+                    f"set={set_num} jpeg/{set_num}/{wl}nm.jpg",
+                    voltage_mv=self.stm.get_battery_mv() if self.stm_ok else -1)
 
             # raw/<set_num>/  — only in RAW mode
             if CAPTURE_FORMAT == "raw" and raw_copy:
@@ -1349,6 +1635,9 @@ class App:
                 raw_set_dir.mkdir(parents=True, exist_ok=True)
                 for wl, dng_bytes in raw_copy:
                     (raw_set_dir / f"{wl}nm.dng").write_bytes(dng_bytes)
+                    log(Logger.FILE_SAVED,
+                        f"set={set_num} raw/{set_num}/{wl}nm.dng ({len(dng_bytes)//1024} KB)",
+                        voltage_mv=self.stm.get_battery_mv() if self.stm_ok else -1)
 
             print(f"Saved set {set_num} → {session}  (format={CAPTURE_FORMAT})")
 
