@@ -463,14 +463,17 @@ class NetworkServer:
         while self._running:
             try:
                 conn, addr = self._sock.accept()
-                # ── keepalive на принятом сокете ──────────────────────────────
+                # ── Агрессивный keepalive на принятом сокете ──────────────────
                 conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                try:
-                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE,  20)
-                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL,  5)
-                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT,    4)
-                except AttributeError:
-                    pass  # Linux-specific constants, на других платформах не ломаем
+                for opt_name, val in (("TCP_KEEPIDLE", 5),
+                                      ("TCP_KEEPINTVL", 2),
+                                      ("TCP_KEEPCNT", 3)):
+                    opt = getattr(socket, opt_name, None)
+                    if opt is not None:
+                        try:
+                            conn.setsockopt(socket.IPPROTO_TCP, opt, val)
+                        except OSError:
+                            pass
                 self._client = conn
                 print(f"PC connected from {addr}")
                 self.app.root.after(0, lambda: self.app.set_pc_connected(True))
@@ -479,26 +482,48 @@ class NetworkServer:
                     self.app.root.after(
                         0, lambda: self.app._offer_retry_pending_session()
                     )
+                # Запускаем приём в этом же потоке. _handle вернётся при разрыве.
                 self._handle(conn)
-                self.app.root.after(0, lambda: self.app.set_pc_connected(False))
+                # ── ВАЖНО: force shutdown+close — это аборт любого in-flight
+                #    sendall() в потоке send_photos. Без этого send_photos
+                #    висел бы в sendall() на мёртвом сокете до OS-level keepalive. ──
+                try: conn.shutdown(socket.SHUT_RDWR)
+                except Exception: pass
+                try: conn.close()
+                except Exception: pass
                 self._client = None
+                self.app.root.after(0, lambda: self.app.set_pc_connected(False))
             except socket.timeout:
                 continue
             except Exception as e:
                 print(f"Server accept error: {e}")
                 time.sleep(1)
 
+    # Сколько секунд тишины от ПК = соединение мёртвое.
+    HEARTBEAT_TIMEOUT_S = 10.0
+
     def _handle(self, conn: socket.socket):
+        """Цикл приёма от ПК. Выходит при разрыве или heartbeat timeout."""
         buf = b""
         conn.settimeout(2.0)
+        last_recv = time.monotonic()
         try:
             while self._running:
+                # Heartbeat: если ПК ничего не шлёт N секунд — считаем его мёртвым.
+                # ПК шлёт ping каждые 3 сек, так что 10 сек тишины = реальная проблема.
+                if time.monotonic() - last_recv > self.HEARTBEAT_TIMEOUT_S:
+                    print(f"PC heartbeat timeout ({self.HEARTBEAT_TIMEOUT_S}s) — closing")
+                    break
                 try:
                     chunk = conn.recv(4096)
                 except socket.timeout:
                     continue
+                except (OSError, ConnectionError) as e:
+                    print(f"recv error: {e}")
+                    break
                 if not chunk:
                     break
+                last_recv = time.monotonic()
                 buf += chunk
                 # Messages delimited by newline JSON
                 while b"\n" in buf:
@@ -561,6 +586,7 @@ class NetworkServer:
             return False
 
         skip_files = skip_files or set()
+        sent_files = set(skip_files)   # объявлено заранее — нужно в except
 
         try:
             # Ждём завершения фоновых потоков записи
@@ -583,9 +609,11 @@ class NetworkServer:
             self._send(conn, meta)
             time.sleep(0.1)
 
-            sent_files = set(skip_files)
-
             for idx, f in enumerate(files, start=1):
+                # Если соединение умерло между файлами — выходим сразу
+                if self._client is None or self._client is not conn:
+                    raise ConnectionError("client socket replaced")
+
                 data     = f.read_bytes()
                 rel_path = f.relative_to(session_dir).as_posix()
                 if progress_cb:
@@ -605,13 +633,15 @@ class NetworkServer:
                 conn.sendall(header)
                 conn.sendall(data)
 
-                # Ждём ACK — без него не отправляем следующий файл
-                if not self._wait_ack(rel_path, timeout=60.0):
-                    # Таймаут ACK — сохраняем состояние для повтора
+                # Ждём ACK — без него не отправляем следующий файл.
+                # Короткий таймаут (12 с) — чуть больше heartbeat ПК (10с) с запасом.
+                if not self._wait_ack(rel_path, timeout=12.0):
                     self._pending_session = (
                         session_dir, patient_id, notes, sent_files
                     )
                     print(f"Transfer interrupted after {len(sent_files)} files")
+                    # Триггерим retry если PC уже переподключился
+                    self._maybe_trigger_retry()
                     return False
 
                 sent_files.add(rel_path)
@@ -624,10 +654,19 @@ class NetworkServer:
             print(f"Photo send error: {e}")
             # Сохраняем незавершённую сессию для повтора
             self._pending_session = (
-                session_dir, patient_id, notes,
-                sent_files if 'sent_files' in dir() else set()
+                session_dir, patient_id, notes, sent_files
             )
+            self._maybe_trigger_retry()
             return False
+
+    def _maybe_trigger_retry(self):
+        """Если PC уже переподключился к моменту падения send_photos —
+        запланировать повтор. Без этой проверки возможен race: новое
+        соединение accept()-нулось ДО того как мы поставили _pending_session,
+        и повтор бы не сработал."""
+        if self._client is not None:
+            # маленькая задержка чтобы accept-обработчик успел отработать
+            self.app.root.after(800, self.app._offer_retry_pending_session)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -896,14 +935,25 @@ class App:
         ps = self.net_server._pending_session
         if not ps:
             return
+        # Идемпотентность: не запускаем второй retry, если первый ещё работает
+        if getattr(self, "_retry_in_progress", False):
+            return
+        # Проверяем что PC реально подключён прямо сейчас
+        if self.net_server._client is None:
+            return
+        self._retry_in_progress = True
         session_dir, patient_id, notes, sent_files = ps
         print(f"Retrying pending session: {session_dir}, "
               f"already sent: {len(sent_files)} files")
+
         def _do_retry():
-            self.net_server.send_photos(
-                session_dir, patient_id, notes,
-                skip_files=sent_files
-            )
+            try:
+                self.net_server.send_photos(
+                    session_dir, patient_id, notes,
+                    skip_files=sent_files
+                )
+            finally:
+                self._retry_in_progress = False
         threading.Thread(target=_do_retry, daemon=True).start()
 
     def receive_task(self, patient_id: str, notes: str):
