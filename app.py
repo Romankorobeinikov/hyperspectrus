@@ -71,6 +71,8 @@ except ImportError:
 W, H         = 800, 480
 ASSETS       = Path("assets")
 LOG_DIR      = Path("logs")           # папка рядом со скриптом
+SESSIONS_DIR = Path("sessions")
+PENDING_STATE_FILE = SESSIONS_DIR / ".pending_state.json"
 PREVIEW_W    = 490
 PANEL_X      = PREVIEW_W + 6
 PANEL_W      = W - PREVIEW_W - 10
@@ -521,6 +523,10 @@ class NetworkServer:
             # PC подтвердил приём файла
             self._last_ack_file = msg.get("filename")
             self._ack_event.set()
+        elif cmd == "cancel_task":
+            # PC попросил отменить текущую задачу
+            self.app.root.after(0, self.app.cancel_current_task)
+            self._send(conn, {"cmd": "task_cancelled"})
 
     def _send(self, conn, data: dict):
         try:
@@ -568,6 +574,7 @@ class NetworkServer:
 
             meta = {
                 "cmd":        "session_start",
+                "session_id": session_dir.name,   # имя папки на Pi — стабильный ключ для PC
                 "patient_id": patient_id,
                 "notes":      notes,
                 "file_count": total,
@@ -916,6 +923,107 @@ class App:
         # Always jump to task confirm screen when a task arrives
         self._show_task_select()
 
+    def cancel_current_task(self):
+        """Отмена задачи по запросу с ПК. Сбрасываем состояние и идём в waiting."""
+        log(Logger.TASK_RECV,
+            f"Task CANCELLED by PC | patient='{self.patient_id}'",
+            voltage_mv=self.stm.get_battery_mv() if self.stm_ok else -1)
+        # Удаляем папку сессии если она была создана но ничего не отправлено
+        if self.session_dir is not None:
+            try:
+                import shutil
+                shutil.rmtree(self.session_dir, ignore_errors=True)
+            except Exception:
+                pass
+        self._reset_session()
+        self.patient_id = "—"
+        self.notes      = ""
+        self._clear_pending_state()
+        # Очистить также pending_session в NetworkServer (если был)
+        try:
+            self.net_server._pending_session = None
+        except Exception:
+            pass
+        if self.screen != "splash":
+            self._stop_cam_preview()
+            self._show_waiting()
+
+    # ── Session persistence (восстановление после жёсткого выключения) ────────
+
+    def _save_pending_state(self):
+        """Сохраняет состояние сессии в JSON атомарно. Вызывается после каждого
+        сохранённого набора и перед началом отправки."""
+        if self.session_dir is None:
+            return
+        state = {
+            "patient_id":  self.patient_id,
+            "notes":       self.notes,
+            "session_dir": str(self.session_dir),
+            "saved_sets":  self.saved_sets,
+            "ts":          datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+        try:
+            SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = PENDING_STATE_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+            os.replace(tmp, PENDING_STATE_FILE)   # атомарно
+        except Exception as e:
+            print(f"save pending state error: {e}")
+
+    def _clear_pending_state(self):
+        try:
+            if PENDING_STATE_FILE.exists():
+                PENDING_STATE_FILE.unlink()
+        except Exception as e:
+            print(f"clear pending state error: {e}")
+
+    def _load_pending_state(self) -> dict:
+        """Возвращает dict состояния если файл валиден и папка содержит файлы.
+        Иначе None и удаляет битый/пустой state."""
+        if not PENDING_STATE_FILE.exists():
+            return None
+        try:
+            state = json.loads(PENDING_STATE_FILE.read_text(encoding="utf-8"))
+            sd = Path(state["session_dir"])
+            if not sd.exists():
+                self._clear_pending_state()
+                return None
+            # Проверим есть ли реально файлы
+            files = [f for f in sd.rglob("*") if f.is_file()]
+            if not files:
+                # Папка пустая — удаляем
+                try:
+                    import shutil
+                    shutil.rmtree(sd, ignore_errors=True)
+                except Exception:
+                    pass
+                self._clear_pending_state()
+                return None
+            state["file_count"] = len(files)
+            return state
+        except Exception as e:
+            print(f"load pending state error: {e}")
+            self._clear_pending_state()
+            return None
+
+    def _restore_pending_session(self, state: dict):
+        """Восстанавливает поля сессии из загруженного state."""
+        self.patient_id  = state["patient_id"]
+        self.notes       = state.get("notes", "")
+        self.session_dir = Path(state["session_dir"])
+        self.saved_sets  = state.get("saved_sets", [])
+        log(Logger.STARTUP,
+            f"Pending session restored | patient='{self.patient_id}' | "
+            f"sets={len(self.saved_sets)} | dir={self.session_dir}",
+            voltage_mv=self.stm.get_battery_mv() if self.stm_ok else -1)
+        # Обновим лейблы
+        txt = f'ID пациента: "{self.patient_id}"'
+        for attr in ("task_title", "finish_title"):
+            lbl = getattr(self, attr, None)
+            if lbl:
+                lbl.config(text=txt)
+
     # ─────────────────────────────────────────────────────────────────────────
     # SCREEN SWITCHER
     # ─────────────────────────────────────────────────────────────────────────
@@ -1231,6 +1339,21 @@ class App:
         self._refresh_warns()
 
     def _finish_cancel(self):
+        # Если на экране восстановленной сессии (после старта) — пользователь
+        # отказался отправлять. Удаляем папку и pending state.
+        if self.patient_id == "—" or not self.pc_connected:
+            # Похоже на восстановленную сессию или нет активной задачи
+            if self.session_dir is not None:
+                try:
+                    import shutil
+                    shutil.rmtree(self.session_dir, ignore_errors=True)
+                except Exception:
+                    pass
+                self._clear_pending_state()
+                self._reset_session()
+                self.patient_id = "—"
+                self._show_waiting()
+                return
         self._show_main()
 
     def _finish_ok(self):
@@ -1274,19 +1397,24 @@ class App:
             log(Logger.SEND_OK,
                 f"patient='{self.patient_id}' files={total_files} all ACKed",
                 voltage_mv=mv_after)
-            # Delete session folder from Pi to free memory
+            # Сессия успешно отправлена — удаляем папку и pending state
+            self._clear_pending_state()
             try:
                 import shutil
                 shutil.rmtree(sd, ignore_errors=True)
                 print(f"Deleted local session: {sd}")
             except Exception as e:
                 print(f"Cleanup error: {e}")
+            self._reset_session()
+            self.root.after(0, self._show_waiting)
         else:
             log(Logger.SEND_FAIL,
-                f"patient='{self.patient_id}' transfer interrupted",
+                f"patient='{self.patient_id}' transfer interrupted — will retry on reconnect",
                 voltage_mv=mv_after)
-        self._reset_session()
-        self.root.after(0, self._show_waiting)
+            # НЕ сбрасываем сессию — pending_session в NetworkServer ждёт реконнекта,
+            # а наш state на диске позволит восстановиться даже после перезапуска.
+            # Просто покажем экран ожидания PC.
+            self.root.after(0, self._show_waiting)
 
     def _reset_session(self):
         self.saved_sets  = []
@@ -1609,7 +1737,7 @@ class App:
         if self.session_dir is None:
             ts      = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             safe_id = self.patient_id.replace(" ", "_").replace("/", "_")
-            self.session_dir = Path("sessions") / f"{safe_id}_{ts}"
+            self.session_dir = SESSIONS_DIR / f"{safe_id}_{ts}"
 
         session = self.session_dir
 
@@ -1640,6 +1768,9 @@ class App:
                         voltage_mv=self.stm.get_battery_mv() if self.stm_ok else -1)
 
             print(f"Saved set {set_num} → {session}  (format={CAPTURE_FORMAT})")
+            # Сохраняем state ПОСЛЕ записи всех файлов (чтобы при крахе во время записи
+            # state не указывал на несуществующие файлы)
+            self.root.after(0, self._save_pending_state)
 
         threading.Thread(target=_save, daemon=True).start()
         self.saved_sets.append(set_num)   # track count, not path
@@ -1652,11 +1783,34 @@ class App:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _boot(self):
+        # Проверяем есть ли незавершённая сессия от прошлого запуска
+        pending = self._load_pending_state()
+        if pending:
+            print(f"Found pending session: {pending['session_dir']} "
+                  f"with {pending['file_count']} files")
+            self._restore_pending_session(pending)
+            # Покажем splash на секунду, потом сразу к экрану finish_confirm
+            # чтобы пользователь мог решить — отправить или продолжить съёмку.
+            self._show_splash()
+            self.root.after(1500, self._show_recovered_session)
+            return
+
         if self.charging in (1, 2):
             self._show_splash()
         else:
             self._show_splash()
             self.root.after(1500, self._show_waiting)
+
+    def _show_recovered_session(self):
+        """После старта с восстановленной сессией — показываем экран
+        подтверждения отправки. Пользователь видит ID пациента и может
+        нажать ✓ для отправки или ✗ для отмены/удаления."""
+        if self.charging in (1, 2):
+            # Если на зарядке — splash важнее, но покажем баннер
+            self._show_splash()
+            return
+        # Сразу на finish_confirm — оттуда либо ✓ (отправить) либо ✗ (отменить)
+        self._show_finish_confirm()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
