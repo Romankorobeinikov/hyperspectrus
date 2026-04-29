@@ -1202,17 +1202,14 @@ class App:
     # ── Session persistence (восстановление после жёсткого выключения) ────────
 
     def _save_pending_state(self, transfer_started: bool = None):
-        """Сохраняет состояние сессии в JSON атомарно. Вызывается:
-        - сразу при receive_task (без session_dir/файлов)
-        - после каждого сохранённого набора (с session_dir и файлами)
-        - перед началом отправки (transfer_started=True)
+        """Сохраняет состояние сессии в JSON атомарно с fsync.
+        Дублируется в session_dir/.session_state.json как fallback на случай
+        если основной .pending_state.json потерялся (битый журнал FS и т.п.).
 
         Если transfer_started не передан — берётся из текущего state на диске
-        (сохраняем флаг между вызовами)."""
-        # Без активной задачи нечего сохранять
+        (чтобы обычное обновление не сбрасывало флаг отправки)."""
         if not self.patient_id or self.patient_id == "—":
             return
-        # Если флаг не указан явно — пытаемся прочитать существующий state
         if transfer_started is None:
             transfer_started = False
             try:
@@ -1223,29 +1220,88 @@ class App:
                 pass
         state = {
             "patient_id":       self.patient_id,
-            "notes":            self.notes,
+            "notes":             self.notes,
             "session_dir":      str(self.session_dir) if self.session_dir else None,
             "saved_sets":       self.saved_sets,
             "transfer_started": transfer_started,
             "ts":               datetime.datetime.now().isoformat(timespec="seconds"),
         }
+        payload = json.dumps(state, ensure_ascii=False, indent=2)
+
+        # ── 1. Главный файл sessions/.pending_state.json ──────────────────────
         try:
             SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-            tmp = PENDING_STATE_FILE.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2),
-                           encoding="utf-8")
-            os.replace(tmp, PENDING_STATE_FILE)   # атомарно
+            self._atomic_write_with_fsync(PENDING_STATE_FILE, payload)
+            self._fsync_dir(SESSIONS_DIR)
+            print(f"[state] saved main: patient='{self.patient_id}' "
+                  f"files={'?' if self.session_dir is None else 'has dir'} "
+                  f"transfer_started={transfer_started}")
         except Exception as e:
-            print(f"save pending state error: {e}")
+            print(f"[state] save main FAILED: {e}")
+
+        # ── 2. Backup внутри самой папки сессии ────────────────────────────────
+        # Если основной файл потеряется — мы найдём этот при сканировании
+        # папок в SESSIONS_DIR.
+        if self.session_dir is not None:
+            try:
+                self.session_dir.mkdir(parents=True, exist_ok=True)
+                backup = self.session_dir / ".session_state.json"
+                self._atomic_write_with_fsync(backup, payload)
+                self._fsync_dir(self.session_dir)
+                print(f"[state] saved backup in {self.session_dir.name}")
+            except Exception as e:
+                print(f"[state] save backup FAILED: {e}")
+
+    @staticmethod
+    def _atomic_write_with_fsync(target: Path, payload: str):
+        """Записать payload в target атомарно: tmp → fsync → replace.
+        После этого файл гарантированно физически на диске."""
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, target)
+
+    @staticmethod
+    def _fsync_dir(path: Path):
+        """fsync на директорию — гарантирует что rename виден после ребута."""
+        try:
+            fd = os.open(str(path), os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass  # не Linux или нет прав — не критично
 
     def _clear_pending_state(self):
+        # Логируем кто чистит state — это поможет отладить если state
+        # пропадает преждевременно
+        import traceback
+        caller = "unknown"
+        try:
+            stack = traceback.extract_stack()
+            if len(stack) >= 2:
+                caller = stack[-2].name
+        except Exception:
+            pass
+        print(f"[state] CLEAR called from {caller}")
+        # Удаляем главный файл
         try:
             if PENDING_STATE_FILE.exists():
                 PENDING_STATE_FILE.unlink()
         except Exception as e:
-            print(f"clear pending state error: {e}")
-        # Сбрасываем флаг восстановления — если эту же сессию потом продолжат
-        # после ✓/✗, _finish_cancel должен поступать как для обычной сессии
+            print(f"[state] clear main error: {e}")
+        # Удаляем backup внутри session_dir (если он там есть)
+        if self.session_dir is not None:
+            try:
+                bkp = self.session_dir / ".session_state.json"
+                if bkp.exists():
+                    bkp.unlink()
+            except Exception:
+                pass
+        # Сбрасываем флаг восстановления
         try:
             del self._restored_transfer_started
         except (AttributeError, Exception):
@@ -1253,47 +1309,121 @@ class App:
 
     def _load_pending_state(self) -> dict:
         """Возвращает dict состояния если файл валиден.
-        Принимает state и без session_dir (задача получена но снимков ещё нет)."""
-        if not PENDING_STATE_FILE.exists():
+        Три уровня восстановления:
+          1. Главный файл sessions/.pending_state.json
+          2. Backup .session_state.json внутри папки сессии
+          3. Восстановление из имени папки + содержимого (самый надёжный)"""
+        state = None
+        source = None
+
+        # ── 1. Главный файл ───────────────────────────────────────────────────
+        if PENDING_STATE_FILE.exists():
+            try:
+                state = json.loads(PENDING_STATE_FILE.read_text(encoding="utf-8"))
+                source = "main"
+            except Exception as e:
+                print(f"[recover] main state corrupt: {e}")
+                state = None
+
+        # ── 2. Fallback: backup .session_state.json в папках сессий ──────────
+        if state is None and SESSIONS_DIR.exists():
+            try:
+                candidates = []
+                for entry in SESSIONS_DIR.iterdir():
+                    if entry.is_dir() and entry.name not in (".", ".."):
+                        bkp = entry / ".session_state.json"
+                        if bkp.exists():
+                            try:
+                                s = json.loads(bkp.read_text(encoding="utf-8"))
+                                candidates.append((s.get("ts", ""), s, entry))
+                            except Exception:
+                                continue
+                if candidates:
+                    candidates.sort(key=lambda x: x[0], reverse=True)
+                    _, state, recovered_dir = candidates[0]
+                    state["session_dir"] = str(recovered_dir)
+                    source = f"backup ({recovered_dir.name})"
+                    print(f"[recover] found backup state: {recovered_dir}")
+            except Exception as e:
+                print(f"[recover] backup scan error: {e}")
+
+        # ── 3. Last resort: восстановление из имени папки + файлов ───────────
+        # Срабатывает когда оба state-файла потеряны, но папки с фото есть.
+        # Имя папки имеет формат "{patient_id}_{YYYYMMDD_HHMMSS}".
+        if state is None and SESSIONS_DIR.exists():
+            try:
+                non_empty_dirs = []
+                for entry in SESSIONS_DIR.iterdir():
+                    if not (entry.is_dir() and entry.name not in (".", "..")):
+                        continue
+                    has_files = any(
+                        f.is_file() and f.name != ".session_state.json"
+                                   and not f.name.endswith(".tmp")
+                        for f in entry.rglob("*")
+                    )
+                    if has_files:
+                        non_empty_dirs.append((entry.stat().st_mtime, entry))
+                if non_empty_dirs:
+                    non_empty_dirs.sort(key=lambda x: x[0], reverse=True)
+                    _, recovered_dir = non_empty_dirs[0]
+                    # Парсим имя: убираем хвост _YYYYMMDD_HHMMSS
+                    pid = recovered_dir.name
+                    parts = pid.rsplit("_", 2)
+                    if len(parts) == 3 and len(parts[1]) == 8 and len(parts[2]) == 6:
+                        pid = parts[0]
+                    pid = pid.replace("_", " ")
+                    state = {
+                        "patient_id":       pid,
+                        "notes":            "",
+                        "session_dir":      str(recovered_dir),
+                        "saved_sets":       [],
+                        "transfer_started": False,
+                        "ts":               datetime.datetime.now().isoformat(timespec="seconds"),
+                    }
+                    source = f"folder-scan ({recovered_dir.name})"
+                    print(f"[recover] reconstructed state from folder: {recovered_dir}")
+            except Exception as e:
+                print(f"[recover] folder-scan error: {e}")
+
+        if state is None:
+            print(f"[recover] no pending state found")
             return None
-        try:
-            state = json.loads(PENDING_STATE_FILE.read_text(encoding="utf-8"))
-            # patient_id обязателен — без него восстанавливать нечего
-            if not state.get("patient_id"):
-                self._clear_pending_state()
-                return None
 
-            sd_str = state.get("session_dir")
-            sd = Path(sd_str) if sd_str else None
-            file_count = 0
-
-            if sd is not None:
-                if sd.exists():
-                    files = [f for f in sd.rglob("*") if f.is_file()]
-                    if files:
-                        file_count = len(files)
-                    else:
-                        # Папка пуста — удаляем её и сбрасываем session_dir
-                        try:
-                            import shutil
-                            shutil.rmtree(sd, ignore_errors=True)
-                        except Exception:
-                            pass
-                        state["session_dir"] = None
-                        state["saved_sets"]  = []
-                else:
-                    # Папка пропала на диске — состояние всё равно валидно
-                    # для восстановления самой задачи (patient_id, notes)
-                    state["session_dir"] = None
-                    state["saved_sets"]  = []
-
-            state["file_count"] = file_count
-            state["transfer_started"] = bool(state.get("transfer_started", False))
-            return state
-        except Exception as e:
-            print(f"load pending state error: {e}")
+        # patient_id обязателен
+        if not state.get("patient_id"):
+            print(f"[recover] state has no patient_id → discard")
             self._clear_pending_state()
             return None
+
+        sd_str = state.get("session_dir")
+        sd = Path(sd_str) if sd_str else None
+        file_count = 0
+
+        if sd is not None:
+            if sd.exists():
+                files = [f for f in sd.rglob("*")
+                         if f.is_file() and f.name != ".session_state.json"
+                         and not f.name.endswith(".tmp")]
+                if files:
+                    file_count = len(files)
+                else:
+                    try:
+                        import shutil
+                        shutil.rmtree(sd, ignore_errors=True)
+                    except Exception:
+                        pass
+                    state["session_dir"] = None
+                    state["saved_sets"]  = []
+            else:
+                state["session_dir"] = None
+                state["saved_sets"]  = []
+
+        state["file_count"] = file_count
+        state["transfer_started"] = bool(state.get("transfer_started", False))
+        print(f"[recover] LOADED from {source}: patient='{state['patient_id']}' "
+              f"files={file_count} transfer_started={state['transfer_started']} "
+              f"dir={state.get('session_dir')}")
+        return state
 
     def _restore_pending_session(self, state: dict):
         """Восстанавливает поля сессии из загруженного state."""
