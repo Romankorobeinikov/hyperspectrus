@@ -800,6 +800,7 @@ class App:
         self._build_task_select()
         self._build_main()
         self._build_finish_confirm()
+        self._build_recovery_confirm()
         self._build_sending()
         self._build_capturing()
         self._build_photo_preview()
@@ -1161,6 +1162,9 @@ class App:
         log(Logger.TASK_RECV,
             f"patient_id='{patient_id}' notes='{notes[:60]}'",
             voltage_mv=self.stm.get_battery_mv() if self.stm_ok else -1)
+        # Сохраняем pending state СРАЗУ — задача может быть прервана до первого снимка.
+        # session_dir будет None, saved_sets пустой — это корректное состояние.
+        self._save_pending_state()
         # Update labels
         txt = f'ID пациента: "{patient_id}"'
         for attr in ("task_title", "finish_title"):
@@ -1197,17 +1201,33 @@ class App:
 
     # ── Session persistence (восстановление после жёсткого выключения) ────────
 
-    def _save_pending_state(self):
-        """Сохраняет состояние сессии в JSON атомарно. Вызывается после каждого
-        сохранённого набора и перед началом отправки."""
-        if self.session_dir is None:
+    def _save_pending_state(self, transfer_started: bool = None):
+        """Сохраняет состояние сессии в JSON атомарно. Вызывается:
+        - сразу при receive_task (без session_dir/файлов)
+        - после каждого сохранённого набора (с session_dir и файлами)
+        - перед началом отправки (transfer_started=True)
+
+        Если transfer_started не передан — берётся из текущего state на диске
+        (сохраняем флаг между вызовами)."""
+        # Без активной задачи нечего сохранять
+        if not self.patient_id or self.patient_id == "—":
             return
+        # Если флаг не указан явно — пытаемся прочитать существующий state
+        if transfer_started is None:
+            transfer_started = False
+            try:
+                if PENDING_STATE_FILE.exists():
+                    old = json.loads(PENDING_STATE_FILE.read_text(encoding="utf-8"))
+                    transfer_started = bool(old.get("transfer_started", False))
+            except Exception:
+                pass
         state = {
-            "patient_id":  self.patient_id,
-            "notes":       self.notes,
-            "session_dir": str(self.session_dir),
-            "saved_sets":  self.saved_sets,
-            "ts":          datetime.datetime.now().isoformat(timespec="seconds"),
+            "patient_id":       self.patient_id,
+            "notes":            self.notes,
+            "session_dir":      str(self.session_dir) if self.session_dir else None,
+            "saved_sets":       self.saved_sets,
+            "transfer_started": transfer_started,
+            "ts":               datetime.datetime.now().isoformat(timespec="seconds"),
         }
         try:
             SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1224,30 +1244,51 @@ class App:
                 PENDING_STATE_FILE.unlink()
         except Exception as e:
             print(f"clear pending state error: {e}")
+        # Сбрасываем флаг восстановления — если эту же сессию потом продолжат
+        # после ✓/✗, _finish_cancel должен поступать как для обычной сессии
+        try:
+            del self._restored_transfer_started
+        except (AttributeError, Exception):
+            pass
 
     def _load_pending_state(self) -> dict:
-        """Возвращает dict состояния если файл валиден и папка содержит файлы.
-        Иначе None и удаляет битый/пустой state."""
+        """Возвращает dict состояния если файл валиден.
+        Принимает state и без session_dir (задача получена но снимков ещё нет)."""
         if not PENDING_STATE_FILE.exists():
             return None
         try:
             state = json.loads(PENDING_STATE_FILE.read_text(encoding="utf-8"))
-            sd = Path(state["session_dir"])
-            if not sd.exists():
+            # patient_id обязателен — без него восстанавливать нечего
+            if not state.get("patient_id"):
                 self._clear_pending_state()
                 return None
-            # Проверим есть ли реально файлы
-            files = [f for f in sd.rglob("*") if f.is_file()]
-            if not files:
-                # Папка пустая — удаляем
-                try:
-                    import shutil
-                    shutil.rmtree(sd, ignore_errors=True)
-                except Exception:
-                    pass
-                self._clear_pending_state()
-                return None
-            state["file_count"] = len(files)
+
+            sd_str = state.get("session_dir")
+            sd = Path(sd_str) if sd_str else None
+            file_count = 0
+
+            if sd is not None:
+                if sd.exists():
+                    files = [f for f in sd.rglob("*") if f.is_file()]
+                    if files:
+                        file_count = len(files)
+                    else:
+                        # Папка пуста — удаляем её и сбрасываем session_dir
+                        try:
+                            import shutil
+                            shutil.rmtree(sd, ignore_errors=True)
+                        except Exception:
+                            pass
+                        state["session_dir"] = None
+                        state["saved_sets"]  = []
+                else:
+                    # Папка пропала на диске — состояние всё равно валидно
+                    # для восстановления самой задачи (patient_id, notes)
+                    state["session_dir"] = None
+                    state["saved_sets"]  = []
+
+            state["file_count"] = file_count
+            state["transfer_started"] = bool(state.get("transfer_started", False))
             return state
         except Exception as e:
             print(f"load pending state error: {e}")
@@ -1258,18 +1299,28 @@ class App:
         """Восстанавливает поля сессии из загруженного state."""
         self.patient_id  = state["patient_id"]
         self.notes       = state.get("notes", "")
-        self.session_dir = Path(state["session_dir"])
+        sd_str = state.get("session_dir")
+        self.session_dir = Path(sd_str) if sd_str else None
         self.saved_sets  = state.get("saved_sets", [])
-        # ── КЛЮЧЕВОЕ: сообщаем NetworkServer'у про незавершённую отправку.
-        # sent_files=set() — после жёсткого выключения мы не знаем, какие файлы
-        # дошли до ПК. Pi отправит всё. ПК атомарно перепишет дубликаты — это OK
-        # (MD5 совпадает, ACK уходит как обычно). ──
-        self.net_server._pending_session = (
-            self.session_dir, self.patient_id, self.notes, set()
-        )
+        file_count       = state.get("file_count", 0)
+        transfer_started = bool(state.get("transfer_started", False))
+        # Запоминаем флаг чтобы _show_recovered_session разветвилось правильно
+        self._restored_transfer_started = transfer_started
+
+        # Авто-retry ставим ТОЛЬКО если отправка уже шла до ребута.
+        # Если отправка не начиналась — юзер сам решает (нажмёт ✓ для отправки
+        # или продолжит съёмку).
+        if (transfer_started
+                and self.session_dir is not None
+                and file_count > 0):
+            self.net_server._pending_session = (
+                self.session_dir, self.patient_id, self.notes, set()
+            )
+
         log(Logger.STARTUP,
-            f"Pending session restored | patient='{self.patient_id}' | "
-            f"sets={len(self.saved_sets)} | dir={self.session_dir}",
+            f"Pending state restored | patient='{self.patient_id}' | "
+            f"sets={len(self.saved_sets)} | files={file_count} | "
+            f"transfer_started={transfer_started} | dir={self.session_dir}",
             voltage_mv=self.stm.get_battery_mv() if self.stm_ok else -1)
         # Обновим лейблы
         txt = f'ID пациента: "{self.patient_id}"'
@@ -1277,10 +1328,9 @@ class App:
             lbl = getattr(self, attr, None)
             if lbl:
                 lbl.config(text=txt)
-        # Race-fix: ПК мог успеть подключиться между запуском NetworkServer
-        # (в App.__init__) и вызовом _restore_pending_session (через 100мс).
-        # Если уже подключён — запускаем retry вручную.
-        if self.net_server._client is not None:
+        # Race-fix: если ПК уже подключён и стоит pending — запустить retry
+        if (self.net_server._client is not None
+                and self.net_server._pending_session is not None):
             self.root.after(500, self._offer_retry_pending_session)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -1445,7 +1495,23 @@ class App:
         self._refresh_warns()
 
     def _task_cancel(self):
-        """Отклонить задачу — вернуться к ожиданию."""
+        """Отклонить задачу — вернуться к ожиданию.
+        Удаляем pending state и папку сессии (если была)."""
+        log(Logger.TASK_RECV,
+            f"Task declined by user | patient='{self.patient_id}'",
+            voltage_mv=self.stm.get_battery_mv() if self.stm_ok else -1)
+        if self.session_dir is not None:
+            try:
+                import shutil
+                shutil.rmtree(self.session_dir, ignore_errors=True)
+            except Exception:
+                pass
+        self._clear_pending_state()
+        try:
+            self.net_server._pending_session = None
+        except Exception:
+            pass
+        self._reset_session()
         self.patient_id = "—"
         self.notes = ""
         self._show_waiting()
@@ -1598,22 +1664,131 @@ class App:
         self._refresh_warns()
 
     def _finish_cancel(self):
-        # Если на экране восстановленной сессии (после старта) — пользователь
-        # отказался отправлять. Удаляем папку и pending state.
-        if self.patient_id == "—" or not self.pc_connected:
-            # Похоже на восстановленную сессию или нет активной задачи
-            if self.session_dir is not None:
-                try:
-                    import shutil
-                    shutil.rmtree(self.session_dir, ignore_errors=True)
-                except Exception:
-                    pass
-                self._clear_pending_state()
-                self._reset_session()
-                self.patient_id = "—"
-                self._show_waiting()
-                return
+        """✗ на экране завершения — вернуться к съёмке (main экран).
+        Это работает одинаково и для обычной сессии, и для восстановленной:
+        юзер может доснять ещё кадры, потом снова нажать «Завершить»."""
         self._show_main()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # RECOVERY CONFIRM SCREEN — показывается после ребута если есть pending
+    # ─────────────────────────────────────────────────────────────────────────
+    def _build_recovery_confirm(self):
+        f = tk.Frame(self.root, bg=BG)
+        self.frames["recovery_confirm"] = f
+
+        # Большая шапка
+        tk.Label(f, text="Задача была прервана",
+                 font=("DejaVu Sans", 32, "bold"),
+                 bg=BG, fg=WARN_COL,
+                 ).place(relx=0.5, rely=0.13, anchor="center")
+        tk.Label(f, text="Продолжить?",
+                 font=("DejaVu Sans", 26),
+                 bg=BG, fg=CARD_FG,
+                 ).place(relx=0.5, rely=0.22, anchor="center")
+
+        # ID пациента в карточке
+        card = tk.Frame(f, bg=CARD_BG, bd=0)
+        card.place(relx=0.5, rely=0.40, anchor="center", width=720, height=130)
+        self.recovery_patient_lbl = tk.Label(card,
+                                             text="",
+                                             font=("DejaVu Sans", 28, "bold"),
+                                             bg=CARD_BG, fg=CARD_FG)
+        self.recovery_patient_lbl.place(relx=0.5, rely=0.30, anchor="center")
+        self.recovery_info_lbl = tk.Label(card, text="",
+                                          font=("DejaVu Sans", 18),
+                                          bg=CARD_BG, fg=TEXT_LIGHT
+                                          if False else "#AAAAAA")
+        self.recovery_info_lbl.place(relx=0.5, rely=0.70, anchor="center")
+
+        # ✗ — слева, ✓ — справа
+        self.recovery_btn_no = tk.Button(f, text="✗",
+                  font=("DejaVu Sans", 54, "bold"),
+                  bg=BTN_IDLE, fg=BTN_DANGER,
+                  activebackground=BTN_IDLE, activeforeground=BTN_DANGER,
+                  relief="flat", bd=0, highlightthickness=0, cursor="hand2")
+        self.recovery_btn_no.place(relx=0.30, rely=0.74, anchor="center",
+                                    width=160, height=120)
+        self.recovery_btn_no_caption = tk.Label(f, text="",
+                                                 font=("DejaVu Sans", 14),
+                                                 bg=BG, fg=CARD_FG)
+        self.recovery_btn_no_caption.place(relx=0.30, rely=0.90, anchor="center")
+
+        self.recovery_btn_yes = tk.Button(f, text="✓",
+                  font=("DejaVu Sans", 54, "bold"),
+                  bg=BTN_IDLE, fg=BTN_OK,
+                  activebackground=BTN_IDLE, activeforeground=BTN_OK,
+                  relief="flat", bd=0, highlightthickness=0, cursor="hand2",
+                  command=self._recovery_continue_shooting)
+        self.recovery_btn_yes.place(relx=0.70, rely=0.74, anchor="center",
+                                     width=160, height=120)
+        self.recovery_btn_yes_caption = tk.Label(f, text="Продолжить съёмку",
+                                                  font=("DejaVu Sans", 14),
+                                                  bg=BG, fg=CARD_FG)
+        self.recovery_btn_yes_caption.place(relx=0.70, rely=0.90, anchor="center")
+
+    def _show_recovery_confirm(self, mode: str):
+        """mode: 'no_files' (случай 1) или 'has_files' (случай 2)."""
+        self.recovery_patient_lbl.config(text=f'ID: "{self.patient_id}"')
+        if mode == "no_files":
+            self.recovery_info_lbl.config(text="Снимки ещё не сделаны")
+            # ✗ — завершить задачу (удалить state)
+            self.recovery_btn_no.config(command=self._recovery_discard_task)
+            self.recovery_btn_no_caption.config(text="Завершить задачу")
+        else:  # has_files
+            try:
+                n = sum(1 for f in self.session_dir.rglob("*") if f.is_file())
+            except Exception:
+                n = 0
+            self.recovery_info_lbl.config(text=f"Несохранённых файлов: {n}")
+            # ✗ — отправить и завершить
+            self.recovery_btn_no.config(command=self._recovery_send_finish)
+            self.recovery_btn_no_caption.config(text="Отправить и завершить")
+        # ✓ — всегда «Продолжить съёмку» (вернуться к main)
+        self._show("recovery_confirm")
+
+    def _recovery_continue_shooting(self):
+        """✓ — продолжить съёмку. Идём на main, всё состояние уже восстановлено."""
+        log(Logger.TASK_RECV,
+            f"Recovery: continue shooting | patient='{self.patient_id}'",
+            voltage_mv=self.stm.get_battery_mv() if self.stm_ok else -1)
+        self._show_main()
+
+    def _recovery_discard_task(self):
+        """✗ для случая 1 — задачи без файлов: завершить задачу."""
+        log(Logger.TASK_RECV,
+            f"Recovery: discard empty task | patient='{self.patient_id}'",
+            voltage_mv=self.stm.get_battery_mv() if self.stm_ok else -1)
+        if self.session_dir is not None:
+            try:
+                import shutil
+                shutil.rmtree(self.session_dir, ignore_errors=True)
+            except Exception:
+                pass
+        self._clear_pending_state()
+        try:
+            self.net_server._pending_session = None
+        except Exception:
+            pass
+        self._reset_session()
+        self.patient_id = "—"
+        self.notes = ""
+        self._show_waiting()
+
+    def _recovery_send_finish(self):
+        """✗ для случая 2 — отправить и завершить (запускает обычный _send_all_photos)."""
+        log(Logger.SEND_START,
+            f"Recovery: send & finish | patient='{self.patient_id}'",
+            voltage_mv=self.stm.get_battery_mv() if self.stm_ok else -1)
+        if self.session_dir is None or not self.session_dir.exists():
+            # Файлов на самом деле нет — поведём как discard
+            self._recovery_discard_task()
+            return
+        try:
+            total = sum(1 for f in self.session_dir.rglob("*") if f.is_file())
+        except Exception:
+            total = 0
+        self._show_sending(total)
+        threading.Thread(target=self._send_all_photos, daemon=True).start()
 
     def _finish_ok(self):
         """Send all saved photos to PC, then go to waiting screen."""
@@ -1639,6 +1814,10 @@ class App:
             total_files = sum(1 for f in sd.rglob("*") if f.is_file())
         except Exception:
             total_files = 0
+        # ── ВАЖНО: помечаем что отправка началась.
+        # Если ребут произойдёт сейчас или в середине — после старта Pi
+        # автоматически дошлёт остаток без участия пользователя. ──
+        self._save_pending_state(transfer_started=True)
         log(Logger.SEND_START,
             f"patient='{self.patient_id}' files={total_files} dir={sd}",
             voltage_mv=mv)
@@ -2061,23 +2240,47 @@ class App:
             self.root.after(1500, self._show_waiting)
 
     def _show_recovered_session(self):
-        """После старта с восстановленной сессией.
-        Если ПК уже подключён — retry уже идёт, показываем экран отправки.
-        Иначе показываем finish_confirm чтобы юзер мог дождаться ПК или отменить."""
+        """После старта с восстановленной сессией. Логика:
+          • Случай 1 (файлов нет)              → recovery_confirm "no_files"
+              ✓ продолжить съёмку, ✗ завершить задачу
+          • Случай 2 (файлы есть, transfer_started=False) → recovery_confirm "has_files"
+              ✓ продолжить съёмку, ✗ отправить и завершить
+          • Случай 3 (transfer_started=True)   → авто-досылка (sending), без подтверждения"""
         if self.charging in (1, 2):
             self._show_splash()
             return
-        if self.pc_connected:
-            # retry запущен в _restore_pending_session → _offer_retry_pending_session
+
+        has_files = False
+        if self.session_dir is not None and self.session_dir.exists():
             try:
-                total = sum(1 for f in self.session_dir.rglob("*") if f.is_file())
+                has_files = any(f.is_file() for f in self.session_dir.rglob("*"))
             except Exception:
-                total = 0
-            self._show_sending(total)
+                has_files = False
+
+        transfer_started = getattr(self, "_restored_transfer_started", False)
+
+        if transfer_started and has_files:
+            # Случай 3 — авто-досылка
+            if self.pc_connected:
+                try:
+                    total = sum(1 for f in self.session_dir.rglob("*") if f.is_file())
+                except Exception:
+                    total = 0
+                self._show_sending(total)
+            else:
+                # ПК ещё нет — показываем sending заранее, _offer_retry_pending_session
+                # триггернётся при подключении и продолжит работу
+                try:
+                    total = sum(1 for f in self.session_dir.rglob("*") if f.is_file())
+                except Exception:
+                    total = 0
+                self._show_sending(total)
+        elif has_files:
+            # Случай 2
+            self._show_recovery_confirm("has_files")
         else:
-            # ПК нет — даём юзеру увидеть что есть несохранённая сессия.
-            # Когда ПК подключится, _offer_retry_pending_session переключит экран сам.
-            self._show_finish_confirm()
+            # Случай 1
+            self._show_recovery_confirm("no_files")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
