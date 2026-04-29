@@ -1112,15 +1112,46 @@ class App:
         print(f"Retrying pending session: {session_dir}, "
               f"already sent: {len(sent_files)} files")
 
+        # Переключаем UI на экран отправки чтобы было видно прогресс
+        try:
+            total = sum(1 for f in session_dir.rglob("*") if f.is_file())
+        except Exception:
+            total = 0
+        try:
+            self._show_sending(total)
+        except Exception:
+            pass
+
         def _do_retry():
+            ok = False
             try:
-                self.net_server.send_photos(
+                ok = self.net_server.send_photos(
                     session_dir, patient_id, notes,
-                    skip_files=sent_files
+                    skip_files=sent_files,
+                    progress_cb=lambda c, t, fn:
+                        self.root.after(0, self._update_send_progress, c, t, fn),
                 )
             finally:
                 self._retry_in_progress = False
+            if ok:
+                # Успешная досылка — удаляем state и папку, чистим экран
+                self.root.after(0, self._cleanup_after_retry, session_dir)
+
         threading.Thread(target=_do_retry, daemon=True).start()
+
+    def _cleanup_after_retry(self, session_dir: Path):
+        """Вызывается из UI-потока после успешной досылки восстановленной сессии."""
+        self._clear_pending_state()
+        try:
+            import shutil
+            shutil.rmtree(session_dir, ignore_errors=True)
+        except Exception:
+            pass
+        self._reset_session()
+        self.patient_id = "—"
+        self.notes      = ""
+        if self.screen != "splash":
+            self._show_waiting()
 
     def receive_task(self, patient_id: str, notes: str):
         self.patient_id  = patient_id
@@ -1229,6 +1260,13 @@ class App:
         self.notes       = state.get("notes", "")
         self.session_dir = Path(state["session_dir"])
         self.saved_sets  = state.get("saved_sets", [])
+        # ── КЛЮЧЕВОЕ: сообщаем NetworkServer'у про незавершённую отправку.
+        # sent_files=set() — после жёсткого выключения мы не знаем, какие файлы
+        # дошли до ПК. Pi отправит всё. ПК атомарно перепишет дубликаты — это OK
+        # (MD5 совпадает, ACK уходит как обычно). ──
+        self.net_server._pending_session = (
+            self.session_dir, self.patient_id, self.notes, set()
+        )
         log(Logger.STARTUP,
             f"Pending session restored | patient='{self.patient_id}' | "
             f"sets={len(self.saved_sets)} | dir={self.session_dir}",
@@ -1239,6 +1277,11 @@ class App:
             lbl = getattr(self, attr, None)
             if lbl:
                 lbl.config(text=txt)
+        # Race-fix: ПК мог успеть подключиться между запуском NetworkServer
+        # (в App.__init__) и вызовом _restore_pending_session (через 100мс).
+        # Если уже подключён — запускаем retry вручную.
+        if self.net_server._client is not None:
+            self.root.after(500, self._offer_retry_pending_session)
 
     # ─────────────────────────────────────────────────────────────────────────
     # SCREEN SWITCHER
@@ -2018,15 +2061,23 @@ class App:
             self.root.after(1500, self._show_waiting)
 
     def _show_recovered_session(self):
-        """После старта с восстановленной сессией — показываем экран
-        подтверждения отправки. Пользователь видит ID пациента и может
-        нажать ✓ для отправки или ✗ для отмены/удаления."""
+        """После старта с восстановленной сессией.
+        Если ПК уже подключён — retry уже идёт, показываем экран отправки.
+        Иначе показываем finish_confirm чтобы юзер мог дождаться ПК или отменить."""
         if self.charging in (1, 2):
-            # Если на зарядке — splash важнее, но покажем баннер
             self._show_splash()
             return
-        # Сразу на finish_confirm — оттуда либо ✓ (отправить) либо ✗ (отменить)
-        self._show_finish_confirm()
+        if self.pc_connected:
+            # retry запущен в _restore_pending_session → _offer_retry_pending_session
+            try:
+                total = sum(1 for f in self.session_dir.rglob("*") if f.is_file())
+            except Exception:
+                total = 0
+            self._show_sending(total)
+        else:
+            # ПК нет — даём юзеру увидеть что есть несохранённая сессия.
+            # Когда ПК подключится, _offer_retry_pending_session переключит экран сам.
+            self._show_finish_confirm()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
